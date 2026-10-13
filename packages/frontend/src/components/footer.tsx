@@ -51,7 +51,12 @@ function getVersionOnce(token: string): Promise<VersionInfo | null> {
     versionPromise = versionApi
       .get(token)
       .then((v) => ({ version: v.version, commit: v.commit }))
-      .catch(() => null);
+      .catch(() => {
+        // A failed request must not poison the cache: a token that expired
+        // mid-session would hide the version until a full page reload.
+        versionPromise = null;
+        return null;
+      });
   }
   return versionPromise;
 }

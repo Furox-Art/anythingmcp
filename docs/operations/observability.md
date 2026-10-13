@@ -64,7 +64,7 @@ Service identity:
 | Env | Default |
 |---|---|
 | `OTEL_SERVICE_NAME` | `anythingmcp-backend` |
-| `OTEL_SERVICE_VERSION` | `npm_package_version` |
+| `OTEL_SERVICE_VERSION` | `APP_VERSION` (from `package.json`) |
 
 The `service.version` value now comes from `APP_VERSION` (resolved from `package.json`), with `APP_COMMIT` and `APP_BUILD_DATE` available as build-time env vars.
 | `OTEL_DEPLOYMENT_ENVIRONMENT` | `NODE_ENV` |

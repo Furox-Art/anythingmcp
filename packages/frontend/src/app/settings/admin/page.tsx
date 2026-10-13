@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useAuth } from '@/lib/auth-context';
-import { adminSettings, type AlertWebhookInput } from '@/lib/api';
+import { adminSettings, versionApi, type AlertWebhookInput } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { AppSelect } from '@/components/ui/select';
@@ -533,6 +533,9 @@ export default function SettingsAdminPage() {
       {/* About this instance */}
       <Card>
         <h3 className="text-sm font-semibold text-[var(--text)] mb-2">About this instance</h3>
+        {!versionInfo && (
+          <p className="text-sm text-[var(--text-3)]">Version info unavailable.</p>
+        )}
         {versionInfo && (
           <div className="space-y-2">
             <p className="text-sm text-[var(--text-2)]">
@@ -545,13 +548,10 @@ export default function SettingsAdminPage() {
             <Button
               variant="secondary"
               size="sm"
-              onClick={() => {
+              onClick={async () => {
                 const text = `AnythingMCP v${versionInfo.version} (commit ${versionInfo.commit}, built ${versionInfo.buildDate ?? 'unknown'}, mode ${versionInfo.deploymentMode})`;
-                navigator.clipboard.writeText(text).then(() => {
-                  setVersionMsg('Copied to clipboard');
-                }).catch(() => {
-                  setVersionMsg('Copy failed');
-                });
+                const ok = await copyText(text);
+                setVersionMsg(ok ? 'Copied to clipboard' : 'Copy failed');
               }}
             >
               Copy version info
