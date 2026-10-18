@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { useTheme } from '@/lib/theme-context';
-import { siteSettings, versionApi } from '@/lib/api';
+import { siteSettings, versionApi, FOOTER_LINKS_CHANGED } from '@/lib/api';
 import { useAuth } from '@/lib/auth-context';
 
 function SunIcon({ size = 16 }: { size?: number }) {
@@ -87,19 +87,49 @@ function VersionBadge({ version }: { version: VersionInfo }) {
   );
 }
 
+/** Links saved before the server checked the scheme: only web and mail links render. */
+function isSafeLink(url: unknown): boolean {
+  return typeof url === 'string' && /^(https?:\/\/|mailto:)/i.test(url.trim());
+}
+
 export function Footer() {
   const { theme, setTheme } = useTheme();
   const { token } = useAuth();
   const [links, setLinks] = useState<FooterLink[]>([]);
   const [version, setVersion] = useState<{ version: string; commit: string } | null>(null);
 
+  // Signed in: the workspace's own links (what its admin saved). Signed out,
+  // or if that call fails: the instance-wide links.
   useEffect(() => {
-    siteSettings.footerLinks().then(setLinks).catch(() => {});
-  }, []);
+    let live = true;
+    const load = () => {
+      const req = token
+        ? siteSettings.workspaceFooterLinks(token).catch(() => siteSettings.footerLinks())
+        : siteSettings.footerLinks();
+      req
+        .then((l) => live && setLinks(Array.isArray(l) ? l.filter((x) => isSafeLink(x?.url)) : []))
+        .catch(() => {});
+    };
+    load();
+    window.addEventListener(FOOTER_LINKS_CHANGED, load);
+    return () => {
+      live = false;
+      window.removeEventListener(FOOTER_LINKS_CHANGED, load);
+    };
+  }, [token]);
 
   useEffect(() => {
-    if (!token) return;
-    getVersionOnce(token).then(setVersion).catch(() => {});
+    let active = true;
+    if (!token) {
+      setVersion(null);
+      return;
+    }
+    getVersionOnce(token).then((value) => {
+      if (active) setVersion(value);
+    });
+    return () => {
+      active = false;
+    };
   }, [token]);
 
   const themeOptions = [

@@ -38,6 +38,7 @@ import { WsdlParser } from './parsers/wsdl.parser';
 import { GraphqlParser } from './parsers/graphql.parser';
 import { PostmanParser } from './parsers/postman.parser';
 import { CurlParser } from './parsers/curl.parser';
+import { HarParser } from './parsers/har.parser';
 import { describeSpecError, readRemoteSpec } from './parsers/spec-read-error';
 import { McpClientEngine } from './engines/mcp-client.engine';
 import { McpOAuthService } from './mcp-oauth.service';
@@ -52,8 +53,9 @@ import { LicenseGuardService } from '../license/license-guard.service';
 import { getRequiredSecret } from '../common/secrets.util';
 import { decrypt } from '../common/crypto/encryption.util';
 import { getAdapter } from '../adapters/catalog';
-import { resolveRestAuthorizeSettings } from './oauth-authorize-settings';
+import { resolvePkce, resolveRestAuthorizeSettings } from './oauth-authorize-settings';
 import { tokenEndpointUserAgent } from './engines/oauth2-token.service';
+import { isMachineGrant } from './oauth-grant.util';
 import {
   DYNAMIC_CLIENT_KEY,
   planMcpAuthorization,
@@ -84,6 +86,12 @@ import {
 import { parseODataTools } from './parsers/odata.parser';
 import { normalizeSettings } from './engines/odata.engine';
 import { computeSetupState } from './connector-setup-status.util';
+import {
+  SECRET_GUARDED_TYPES,
+  SecretExtractor,
+  mergeSummaries,
+  type SecretMoveSummary,
+} from './secret-extraction.util';
 
 class CreateConnectorDto {
   @ApiProperty({
@@ -300,6 +308,46 @@ class UpdateOAuthConfigDto {
   @IsString()
   @IsIn(['', 'client_secret_post', 'client_secret_basic', 'basic', 'post', 'private_key_jwt'])
   tokenAuthMethod?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'How the connector obtains its access token. `authorization_code` ' +
+      '(default, also sent as an empty string) signs in at the provider with ' +
+      '"Authorize with Provider" and renews with the refresh token. ' +
+      '`client_credentials` asks the token endpoint with the client id and ' +
+      'secret alone. `password` (RFC 6749 §4.3) sends `username` and ' +
+      '`password` as well, and asks again whenever the token expires: for ' +
+      'APIs that issue no refresh token, such as Datto RMM (username = API ' +
+      'key, password = API secret, client `public-client` / `public` sent as ' +
+      'HTTP Basic).',
+    enum: ['', 'authorization_code', 'client_credentials', 'password'],
+  })
+  @IsOptional()
+  @IsString()
+  @IsIn(['', 'authorization_code', 'client_credentials', 'password'])
+  grant?: string;
+
+  @ApiPropertyOptional({ description: 'Username for the password grant.' })
+  @IsOptional()
+  @IsString()
+  username?: string;
+
+  @ApiPropertyOptional({ description: 'Password for the password grant.' })
+  @IsOptional()
+  @IsString()
+  password?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Whether "Authorize with Provider" uses PKCE (RFC 7636): a ' +
+      '`code_challenge` on the authorization URL and a `code_verifier` on the ' +
+      'code exchange. On by default. Turn it off for providers that refuse ' +
+      "it, such as LinkedIn's standard web flow (401 invalid_client). " +
+      'REST and GraphQL connectors only; MCP servers always use PKCE.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  pkce?: boolean;
 }
 
 class UpdateOAuth1ConfigDto {
@@ -334,12 +382,12 @@ class UpdateOAuth1ConfigDto {
 
 class ImportToolsDto {
   @ApiProperty({
-    enum: ['openapi', 'wsdl', 'graphql', 'postman', 'curl', 'json', 'mcp', 'odata'],
+    enum: ['openapi', 'wsdl', 'graphql', 'postman', 'curl', 'har', 'json', 'mcp', 'odata'],
     description: 'Which parser to run on the supplied content/url.',
     example: 'openapi',
   })
   @IsString()
-  source: 'openapi' | 'wsdl' | 'graphql' | 'postman' | 'curl' | 'json' | 'mcp' | 'odata';
+  source: 'openapi' | 'wsdl' | 'graphql' | 'postman' | 'curl' | 'har' | 'json' | 'mcp' | 'odata';
 
   @ApiPropertyOptional({
     description: 'Inline spec content (JSON or YAML). Mutually exclusive with `url`.',
@@ -562,6 +610,7 @@ export class ConnectorsController {
     private readonly graphqlParser: GraphqlParser,
     private readonly postmanParser: PostmanParser,
     private readonly curlParser: CurlParser,
+    private readonly harParser: HarParser,
     private readonly mcpClientEngine: McpClientEngine,
     private readonly mcpOAuthService: McpOAuthService,
     private readonly catalogResync: CatalogResyncService,
@@ -654,12 +703,31 @@ export class ConnectorsController {
   async create(@Req() req: any, @Body() dto: CreateConnectorDto) {
     this.assertCanCreate(req);
     this.assertUsableBaseUrl(dto.baseUrl, dto.type);
-    // Variables typed with a hand-built connector: cleaned as on every later edit.
-    const data = dto.envVars
-      ? { ...dto, envVars: this.normalizeVariables({ ...dto, config: null }, dto.envVars) }
+    // A key typed into the URL or a header (`https://api.telegram.org/bot<token>`)
+    // moves into an encrypted variable and is referenced as {{VAR}}.
+    const secrets = new SecretExtractor(dto.name, dto.envVars);
+    const guarded = SECRET_GUARDED_TYPES.has(dto.type)
+      ? {
+          ...dto,
+          baseUrl: secrets.extractUrl(dto.baseUrl, 'baseUrl'),
+          headers: secrets.extractHeaders(dto.headers, 'headers') as Record<string, string> | undefined,
+        }
       : dto;
+    // Variables typed with a hand-built connector: cleaned as on every later edit.
+    const envVars = dto.envVars
+      ? this.normalizeVariables({ ...dto, config: null }, dto.envVars)
+      : undefined;
+    const data =
+      envVars || secrets.changed
+        ? { ...guarded, envVars: { ...(envVars ?? {}), ...secrets.newEnvVars } }
+        : guarded;
     await this.licenseGuard.checkCanCreateConnector(req.user.sub, req.user.organizationId);
     const connector = await this.connectorsService.create(req.user.sub, req.user.organizationId, data);
+    if (secrets.changed) {
+      this.logger.log(
+        `Moved ${secrets.moved.length} secret literal(s) of new connector ${connector.id} into variables`,
+      );
+    }
 
     // Auto-create default tools for DATABASE connectors
     if (dto.type === 'DATABASE') {
@@ -693,7 +761,7 @@ export class ConnectorsController {
       const builtinTools = buildGraphqlBuiltinTools({
         prefix: slugifyForPrefix(dto.name),
         displayName: dto.name,
-        baseUrl: dto.baseUrl,
+        baseUrl: data.baseUrl,
         schemaUrl: (dto.config as { schemaUrl?: string } | undefined)?.schemaUrl,
       });
       for (const tool of builtinTools) {
@@ -765,7 +833,7 @@ export class ConnectorsController {
       );
     }
 
-    return { ...toPublicConnector(connector), attachedToServer: attachedTo };
+    return { ...toPublicConnector(connector), attachedToServer: attachedTo, ...secrets.summary() };
   }
 
   /**
@@ -958,6 +1026,30 @@ export class ConnectorsController {
     if (dto.headers) {
       data.headers = mergeMaskedHeaders(dto.headers, connector.headers, ctx);
     }
+    // A key typed into the base URL or a header moves into an encrypted
+    // variable. Only what this request writes is scanned: a stored header the
+    // form sent back masked (and a catalog connector's resolved headers) is
+    // left as it is.
+    const secrets = new SecretExtractor(
+      connector.name,
+      (data.envVars ?? connector.envVars) as Record<string, string> | null,
+    );
+    if (SECRET_GUARDED_TYPES.has(connector.type)) {
+      if (data.baseUrl !== undefined) data.baseUrl = secrets.extractUrl(data.baseUrl, 'baseUrl');
+      if (data.headers) {
+        const stored = (connector.headers as Record<string, unknown> | null) ?? {};
+        const written = new Set(
+          Object.keys(data.headers).filter((name) => data.headers![name] !== stored[name]),
+        );
+        data.headers = secrets.extractHeaders(data.headers, 'headers', written) as Record<string, string>;
+      }
+      if (Object.keys(secrets.newEnvVars).length > 0) {
+        data.envVars = {
+          ...((data.envVars ?? connector.envVars ?? {}) as Record<string, string>),
+          ...secrets.newEnvVars,
+        };
+      }
+    }
     // `config` also carries keys no form edits: the catalog adapter's slug,
     // version and baselines (logo, re-sync), a database adapter's
     // deniedTables. The database settings form sends only { readOnly }, and
@@ -985,7 +1077,7 @@ export class ConnectorsController {
     // showed in the form and was ignored by every tool until the next
     // restart; the env-vars and tool routes already reload, this one did not.
     await this.mcpServer.reloadConnectorTools(id);
-    return toPublicConnector(updated);
+    return { ...toPublicConnector(updated), ...secrets.summary() };
   }
 
   /** The stored OAuth2 grant, or undefined when there is none or it cannot be read. */
@@ -1021,20 +1113,31 @@ export class ConnectorsController {
       }
     }
     const str = (v: unknown) => (typeof v === 'string' ? v : '');
+    const adapterSlug = (connector.config as { adapterSlug?: string } | null)?.adapterSlug;
     return {
       clientId: str(cfg.clientId),
+      grant: isMachineGrant(cfg.grant) ? String(cfg.grant) : 'authorization_code',
       authorizationUrl: str(cfg.authorizationUrl),
       tokenUrl: str(cfg.tokenUrl),
       scopes: str(cfg.scopes),
       // Report what the token service will actually do. With nothing stored,
-      // the client_credentials grant sends HTTP Basic, not body credentials;
-      // showing "in body" there made the form misstate every such connector.
+      // the client_credentials and password grants send HTTP Basic, not body
+      // credentials; showing "in body" there made the form misstate every
+      // such connector.
       tokenAuthMethod:
         str(cfg.tokenAuthMethod) ||
-        (cfg.grant === 'client_credentials'
-          ? 'client_secret_basic'
-          : 'client_secret_post'),
+        (isMachineGrant(cfg.grant) ? 'client_secret_basic' : 'client_secret_post'),
+      // What the authorization will do: the row's own setting, else the
+      // catalog adapter's (see resolvePkce).
+      pkce: resolvePkce(
+        cfg,
+        adapterSlug ? getAdapter(adapterSlug)?.connector.authConfig : undefined,
+      ),
       hasClientSecret: !!cfg.clientSecret,
+      // The password grant's credentials (Datto's API key and secret) are
+      // never returned, like the client secret.
+      hasUsername: !!cfg.username,
+      hasPassword: !!cfg.password,
       hasAccessToken: !!cfg.accessToken,
       hasRefreshToken: !!cfg.refreshToken,
     };
@@ -1049,8 +1152,10 @@ export class ConnectorsController {
       'endpoints established during authorization are preserved. Omitted ' +
       'fields keep their current value; send an empty string to clear one. ' +
       'Use `tokenAuthMethod` when a provider rejects credentials sent in the ' +
-      'request body (RFC 6749 §2.3.1 client_secret_basic) — Datto RMM and ' +
-      'DATEV both require it.',
+      'request body (RFC 6749 §2.3.1 client_secret_basic) — DATEV requires ' +
+      'it. Use `grant` for APIs that issue tokens without a user sign-in: ' +
+      '`client_credentials`, or `password` with `username` and `password` ' +
+      '(Datto RMM, whose 100-hour tokens come with no refresh token).',
   })
   async updateOAuthConfig(
     @Req() req: any,
@@ -1073,20 +1178,32 @@ export class ConnectorsController {
       'authorizationUrl',
       'tokenUrl',
       'scopes',
+      'username',
+      'password',
     ] as const) {
       if (dto[key] !== undefined) patch[key] = dto[key];
     }
+    if (dto.grant !== undefined) {
+      // The authorization-code flow is the default and is stored as no grant
+      // at all, which is what every connector authorized so far carries.
+      patch.grant = isMachineGrant(dto.grant) ? dto.grant : undefined;
+    }
     if (dto.tokenAuthMethod !== undefined) {
       // Empty = back to the default (credentials in the body). Except that
-      // "in the body" is not the default of the client_credentials grant —
-      // the token service sends HTTP Basic there unless told otherwise — so
-      // for that grant the form's "in body" choice has to be stored as such,
-      // or saving the form would quietly switch e.g. Amadeus back to Basic.
+      // "in the body" is not the default of the client_credentials and
+      // password grants — the token service sends HTTP Basic there unless
+      // told otherwise — so for those the form's "in body" choice has to be
+      // stored as such, or saving the form would quietly switch e.g. Amadeus
+      // back to Basic.
+      const grant =
+        dto.grant !== undefined ? dto.grant : this.readOAuthGrant(connector.authConfig);
       patch.tokenAuthMethod =
-        dto.tokenAuthMethod ||
-        (this.readOAuthGrant(connector.authConfig) === 'client_credentials'
-          ? 'client_secret_post'
-          : undefined);
+        dto.tokenAuthMethod || (isMachineGrant(grant) ? 'client_secret_post' : undefined);
+    }
+    if (dto.pkce !== undefined) {
+      // Stored either way: an explicit `true` must also beat a catalog
+      // adapter's `pkce: false` (see resolvePkce).
+      patch.pkce = dto.pkce;
     }
 
     if (Object.keys(patch).length === 0) {
@@ -1244,6 +1361,9 @@ export class ConnectorsController {
       // from dynamic registration.
       let resource: string | undefined;
       let dynamicClient = false;
+      // PKCE (RFC 7636) is on unless a REST/GraphQL connector turned it off.
+      // MCP authorization always requires it.
+      let pkce = true;
 
       if (connector.type === 'MCP') {
         // MCP: discover OAuth metadata from the remote server, then pick the
@@ -1339,6 +1459,7 @@ export class ConnectorsController {
         scope = settings.scope;
         tokenAuthMethod = settings.tokenAuthMethod;
         clientAssertion = settings.clientAssertion;
+        pkce = settings.pkce;
         // The client id/secret stay as stored (placeholders included, so a
         // later env var edit still reaches them); only what was taken from
         // the catalog is added.
@@ -1359,14 +1480,16 @@ export class ConnectorsController {
         interpolateDeep(connector.headers ?? undefined, flowVars),
       );
 
-      // Generate PKCE challenge
-      const codeVerifier = this.mcpOAuthService.generateCodeVerifier();
-      const codeChallenge = this.mcpOAuthService.generateCodeChallenge(codeVerifier);
+      // Generate the PKCE challenge, unless the connector turned PKCE off.
+      const codeVerifier = pkce ? this.mcpOAuthService.generateCodeVerifier() : undefined;
+      const codeChallenge = codeVerifier
+        ? this.mcpOAuthService.generateCodeChallenge(codeVerifier)
+        : undefined;
       const state = this.mcpOAuthService.generateState();
 
       // Store pending flow
       await this.mcpOAuthService.storePendingFlow(state, {
-        codeVerifier,
+        ...(codeVerifier ? { codeVerifier } : {}),
         connectorId: connector.id,
         userId: req.user.sub,
         redirectUri: callbackUrl,
@@ -1416,16 +1539,14 @@ export class ConnectorsController {
     }
 
     try {
-      const authConfig = connector.authConfig
-        ? JSON.parse(decrypt(connector.authConfig, this.encryptionKey))
-        : undefined;
+      const { baseUrl, headers, authConfig } = this.resolvedAddress(connector);
 
       const mcpPath = mcpPathOf(connector.config);
       const remoteTools = await this.mcpClientEngine.listTools({
-        baseUrl: connector.baseUrl,
+        baseUrl,
         authType: connector.authType,
         authConfig,
-        headers: connector.headers as Record<string, string>,
+        headers,
         connectorId: connector.id,
         mcpPath,
       });
@@ -1449,7 +1570,7 @@ export class ConnectorsController {
       // catalog's policy (tool prefix, tools switched off by default,
       // annotations) when its tools are discovered again.
       return this.createToolsFromParsed(
-        connector.id,
+        connector,
         catalogMcpToolsFor(connector.config, discovered),
       );
     } catch (error: any) {
@@ -1472,6 +1593,7 @@ export class ConnectorsController {
     }
 
     const results = { created: 0, skipped: 0, tools: 0, errors: [] as string[] };
+    const moves: SecretMoveSummary[] = [];
 
     for (const c of body.connectors) {
       // Connector names are not unique in the schema, so the P2002 branch
@@ -1495,6 +1617,31 @@ export class ConnectorsController {
         break;
       }
 
+      // A backup written before the guard existed may hold keys in URLs,
+      // headers and tools: restored, they land in variables instead.
+      const secrets = new SecretExtractor(c.name, c.envVars as Record<string, string> | undefined);
+      const guarded = SECRET_GUARDED_TYPES.has(c.type);
+      const baseUrl = guarded ? secrets.extractUrl(c.baseUrl, 'baseUrl') : c.baseUrl;
+      // A catalog connector's headers are rebuilt from its own template when
+      // its variables change (catalog-env-rebuild.util.ts); they are left alone.
+      const fromCatalog = !!(c.config as { adapterSlug?: unknown } | undefined)?.adapterSlug;
+      const headers =
+        guarded && !fromCatalog ? secrets.extractHeaders(c.headers, 'headers') : c.headers;
+      // A catalog install's snapshot of its base URL holds the same token
+      // (and `config` is returned to every member of the workspace).
+      const rawConfig = c.config as Record<string, unknown> | undefined;
+      const baseline = rawConfig?.baseUrlBaseline;
+      const config =
+        guarded && typeof baseline === 'string'
+          ? { ...rawConfig, baseUrlBaseline: secrets.extractUrl(baseline, 'config.baseUrlBaseline') }
+          : c.config;
+      const tools =
+        guarded && Array.isArray(c.tools) ? c.tools.map((t) => secrets.extractTool(t)) : c.tools;
+      const envVars =
+        Object.keys(secrets.newEnvVars).length > 0
+          ? { ...((c.envVars as Record<string, string> | undefined) ?? {}), ...secrets.newEnvVars }
+          : c.envVars;
+
       try {
         const connector = await this.prisma.connector.create({
           data: {
@@ -1502,19 +1649,26 @@ export class ConnectorsController {
             organizationId: req.user.organizationId,
             name: c.name,
             type: c.type,
-            baseUrl: c.baseUrl,
+            baseUrl,
             isActive: c.isActive ?? true,
             authType: c.authType || 'NONE',
             specUrl: c.specUrl,
-            headers: c.headers as any,
-            config: c.config as any,
-            envVars: c.envVars as any,
+            headers: headers as any,
+            config: config as any,
+            envVars: envVars as any,
           },
         });
         results.created++;
+        const summary = secrets.summary();
+        if (summary.secretsMoved || summary.renamedTools) {
+          moves.push({
+            ...summary,
+            secretsMoved: summary.secretsMoved?.map((m) => ({ ...m, field: `${c.name}: ${m.field}` })),
+          });
+        }
 
-        if (Array.isArray(c.tools)) {
-          for (const t of c.tools) {
+        if (Array.isArray(tools)) {
+          for (const t of tools) {
             try {
               await this.prisma.mcpTool.create({
                 data: {
@@ -1549,6 +1703,7 @@ export class ConnectorsController {
     return {
       message: `Imported ${results.created} connectors with ${results.tools} tools${results.skipped > 0 ? `, skipped ${results.skipped} duplicates` : ''}`,
       ...results,
+      ...mergeSummaries(moves),
     };
   }
 
@@ -1581,15 +1736,15 @@ export class ConnectorsController {
         break;
       }
       case 'SOAP': {
-        const wsdlUrl = connector.specUrl || connector.baseUrl;
+        const wsdlUrl = connector.specUrl || this.resolvedAddress(connector).baseUrl;
         parsedTools = await readRemoteSpec('WSDL', () => this.wsdlParser.parse(wsdlUrl));
         break;
       }
       case 'GRAPHQL': {
-        const headers = connector.headers as Record<string, string> | undefined;
+        const { baseUrl, headers } = this.resolvedAddress(connector);
         parsedTools = await readRemoteSpec('GraphQL schema', () =>
           this.graphqlParser.parse(
-            connector.baseUrl, headers || undefined, connector.specUrl || undefined,
+            baseUrl, headers || undefined, connector.specUrl || undefined,
           ),
         );
         break;
@@ -1607,12 +1762,12 @@ export class ConnectorsController {
       });
     }
 
-    return this.createToolsFromParsed(connector.id, parsedTools);
+    return this.createToolsFromParsed(connector, parsedTools);
   }
 
   @Post(':id/import')
   @ApiOperation({
-    summary: 'Import tools from any source: OpenAPI, Postman, cURL, WSDL, GraphQL',
+    summary: 'Import tools from any source: OpenAPI, Postman, cURL, HAR, WSDL, GraphQL',
   })
   async importTools(
     @Req() req: any,
@@ -1628,6 +1783,7 @@ export class ConnectorsController {
     let odataScope: string | undefined;
 
     let detectedHealthcheckPath: string | undefined;
+    let harSkipped: { otherOrigin: number; staticAsset: number; duplicate: number } | undefined;
 
     try {
       switch (dto.source) {
@@ -1645,13 +1801,14 @@ export class ConnectorsController {
           break;
         }
         case 'wsdl': {
-          const wsdlUrl = dto.url || dto.content || connector.baseUrl;
+          const wsdlUrl = dto.url || dto.content || this.resolvedAddress(connector).baseUrl;
           parsedTools = await this.wsdlParser.parse(wsdlUrl);
           break;
         }
         case 'graphql': {
-          const headers = connector.headers as Record<string, string> | undefined;
-          const endpoint = dto.url || connector.baseUrl;
+          const resolved = this.resolvedAddress(connector);
+          const headers = resolved.headers;
+          const endpoint = dto.url || resolved.baseUrl;
           parsedTools = await this.graphqlParser.parse(
             endpoint, headers || undefined, dto.url || undefined,
           );
@@ -1672,6 +1829,16 @@ export class ConnectorsController {
             return { error: 'Provide the cURL command(s) in content field' };
           }
           parsedTools = this.curlParser.parse(dto.content);
+          break;
+        }
+        case 'har': {
+          if (!dto.content) {
+            return { error: 'Provide the HAR file content in the content field' };
+          }
+          const { baseUrl } = this.resolvedAddress(connector);
+          const result = this.harParser.parse(dto.content, { baseUrl });
+          parsedTools = result.tools;
+          harSkipped = result.skipped;
           break;
         }
         case 'json': {
@@ -1705,14 +1872,12 @@ export class ConnectorsController {
           if (connector.type !== 'MCP') {
             return { error: 'MCP import source is only available for MCP connectors' };
           }
-          const authConfig = connector.authConfig
-            ? JSON.parse(decrypt(connector.authConfig, this.encryptionKey))
-            : undefined;
+          const { baseUrl, headers, authConfig } = this.resolvedAddress(connector);
           const remoteTools = await this.mcpClientEngine.listTools({
-            baseUrl: connector.baseUrl,
+            baseUrl,
             authType: connector.authType,
             authConfig,
-            headers: connector.headers as Record<string, string>,
+            headers,
             mcpPath: dto.url || '/mcp',
             connectorId: connector.id,
           });
@@ -1778,9 +1943,9 @@ export class ConnectorsController {
     // Retiring everything else is what a full spec import (OpenAPI, WSDL…)
     // means; for a handful of hand-written tools it disabled every other tool
     // of the connector, catalog tools included.
-    const additive = dto.source === 'json' || dto.source === 'curl';
-    return this.createToolsFromParsed(
-      connector.id,
+    const additive = dto.source === 'json' || dto.source === 'curl' || dto.source === 'har';
+    const result = await this.createToolsFromParsed(
+      connector,
       parsedTools,
       additive
         ? () => false
@@ -1791,6 +1956,14 @@ export class ConnectorsController {
             }
           : undefined,
     );
+    if (harSkipped) {
+      return {
+        ...result,
+        message: `${result.message} (skipped ${harSkipped.otherOrigin} other-origin, ${harSkipped.staticAsset} static/socket, ${harSkipped.duplicate} duplicate entries)`,
+        harSkipped,
+      };
+    }
+    return result;
   }
 
   @Put(':id/env-vars')
@@ -1933,6 +2106,36 @@ export class ConnectorsController {
     });
   }
 
+  /**
+   * The connector's address, headers and auth with its variables filled in,
+   * as a tool call sends them. Discovery and spec imports used the stored
+   * values as they are, so a base URL holding `{{VAR}}` (a key moved out of
+   * it, a tenant) was requested literally.
+   */
+  private resolvedAddress(connector: {
+    baseUrl: string;
+    headers: unknown;
+    envVars: unknown;
+    authConfig: string | null;
+  }): {
+    baseUrl: string;
+    headers: Record<string, string> | undefined;
+    authConfig: Record<string, unknown> | undefined;
+  } {
+    const envVars = (connector.envVars as Record<string, string> | null) ?? {};
+    const authConfig = connector.authConfig
+      ? JSON.parse(decrypt(connector.authConfig, this.encryptionKey))
+      : undefined;
+    return {
+      baseUrl: interpolateString(connector.baseUrl, envVars),
+      headers: interpolateDeep(
+        (connector.headers as Record<string, string> | null) ?? undefined,
+        envVars,
+      ),
+      authConfig: authConfig ? interpolateDeep(authConfig, envVars) : undefined,
+    };
+  }
+
   /** The stored authConfig, or null when there is none or it cannot be read. */
   private readAuthConfig(authConfig: string | null): Record<string, unknown> | null {
     if (!authConfig) return null;
@@ -2007,14 +2210,37 @@ export class ConnectorsController {
    * the visibility of "this endpoint no longer exists upstream".
    */
   private async createToolsFromParsed(
-    connectorId: string,
+    connector: { id: string; name: string; type: string; envVars: unknown },
     parsedTools: any[],
     /** Which unmatched existing tools this import may retire (default: all but built-ins). */
     inScope?: (tool: { endpointMapping: unknown }) => boolean,
   ) {
+    const connectorId = connector.id;
     const existing = await this.prisma.mcpTool.findMany({
       where: { connectorId },
     });
+
+    // A spec, collection or cURL command may carry a key in a path, query
+    // string or header (and the generated name or description repeats it).
+    // It moves into an encrypted variable before anything is stored. Names
+    // of existing tools are not reserved: a re-import of the same request
+    // must match the tool the first import created.
+    const secrets = new SecretExtractor(
+      connector.name,
+      connector.envVars as Record<string, string> | null,
+    );
+    // A DATABASE tool's "path" is its SQL, not an address.
+    if (SECRET_GUARDED_TYPES.has(connector.type)) {
+      parsedTools = parsedTools.map((tool) => secrets.extractTool(tool));
+    }
+    if (Object.keys(secrets.newEnvVars).length > 0) {
+      await this.connectorsService.addEnvVars(connectorId, secrets.newEnvVars);
+    }
+    if (secrets.changed) {
+      this.logger.log(
+        `Import into connector ${connectorId}: moved ${secrets.moved.length} secret literal(s) into variables, renamed ${secrets.renamedTools.length} tool(s)`,
+      );
+    }
     const byOperationId = new Map<string, typeof existing[number]>();
     const byEndpoint = new Map<string, typeof existing[number]>();
     const byName = new Map<string, typeof existing[number]>();
@@ -2028,6 +2254,11 @@ export class ConnectorsController {
     }
 
     const matchedIds = new Set<string>();
+    // Matched tools that kept their name because another tool of the
+    // connector already has the wanted one (the name is unique per connector).
+    const renameConflicts: Array<{ toolId: string; kept: string; wanted: string }> = [];
+    // Parsed tools not created because their name is already in use.
+    const skipped: string[] = [];
     let createdCount = 0;
     let updatedCount = 0;
     const tools: any[] = [];
@@ -2038,21 +2269,34 @@ export class ConnectorsController {
         em?.method && em?.path
           ? `${String(em.method).toUpperCase()} ${em.path}`
           : null;
+      // A tool another entry of this import already matched is not a
+      // candidate again: two entries with the same operationId, endpoint or
+      // name would otherwise overwrite each other.
+      const unclaimed = (t: (typeof existing)[number] | undefined) =>
+        t && !matchedIds.has(t.id) ? t : undefined;
       // By name last: a static tool has no path to match on, and without this
       // a re-import tried to create it again, hit the unique name and left the
       // old (possibly retired) copy as it was.
       const match =
-        (tool.operationId && byOperationId.get(tool.operationId)) ||
-        (endpointKey && byEndpoint.get(endpointKey)) ||
-        byName.get(tool.name) ||
+        (tool.operationId && unclaimed(byOperationId.get(tool.operationId))) ||
+        (endpointKey && unclaimed(byEndpoint.get(endpointKey))) ||
+        unclaimed(byName.get(tool.name)) ||
         null;
 
       if (match) {
         matchedIds.add(match.id);
+        // When a different tool holds the wanted name (two endpoints swapped
+        // names, or a tool renamed by hand), keep the current name and still
+        // refresh everything else, instead of failing the import on P2002.
+        const holder = byName.get(tool.name);
+        const nameTaken = holder !== undefined && holder.id !== match.id;
+        if (nameTaken) {
+          renameConflicts.push({ toolId: match.id, kept: match.name, wanted: tool.name });
+        }
         const updated = await this.prisma.mcpTool.update({
           where: { id: match.id },
           data: {
-            name: tool.name,
+            ...(nameTaken ? {} : { name: tool.name }),
             description: tool.description,
             parameters: tool.parameters as any,
             endpointMapping: tool.endpointMapping as any,
@@ -2083,8 +2327,20 @@ export class ConnectorsController {
             isEnabled: match.deprecatedAt ? true : match.isEnabled,
           },
         });
+        if (!nameTaken && match.name !== tool.name) {
+          if (byName.get(match.name)?.id === match.id) byName.delete(match.name);
+          byName.set(tool.name, match);
+        }
         tools.push(updated);
         updatedCount++;
+        continue;
+      }
+
+      // Another tool of the connector (an existing one matched by a
+      // different entry, or one created earlier in this import) already has
+      // this name.
+      if (byName.has(tool.name)) {
+        skipped.push(tool.name);
         continue;
       }
 
@@ -2106,13 +2362,34 @@ export class ConnectorsController {
             ...(tool.origin === 'catalog' ? { origin: 'catalog' } : {}),
           },
         });
+        matchedIds.add(created.id);
+        byName.set(created.name, created);
         tools.push(created);
         createdCount++;
       } catch (err: any) {
-        // A different existing tool happens to share the new tool's name
-        // (e.g. same name across two re-imports on parametric paths).
-        // Skip rather than throw — preserves prior semantics.
+        // A concurrent write took the name in the meantime.
         if (err.code !== 'P2002') throw err;
+        skipped.push(tool.name);
+      }
+    }
+
+    // A name may have been freed by a rename later in the loop (A wants B's
+    // name, B moves on to a new one): apply those renames now. A true swap
+    // stays a conflict, the tools keep their names.
+    for (let progress = true; progress && renameConflicts.length > 0; ) {
+      progress = false;
+      for (const conflict of [...renameConflicts]) {
+        if (byName.has(conflict.wanted)) continue;
+        const renamed = await this.prisma.mcpTool.update({
+          where: { id: conflict.toolId },
+          data: { name: conflict.wanted },
+        });
+        if (byName.get(conflict.kept)?.id === conflict.toolId) byName.delete(conflict.kept);
+        byName.set(conflict.wanted, renamed);
+        const i = tools.findIndex((t) => t.id === conflict.toolId);
+        if (i >= 0) tools[i] = renamed;
+        renameConflicts.splice(renameConflicts.indexOf(conflict), 1);
+        progress = true;
       }
     }
 
@@ -2137,15 +2414,21 @@ export class ConnectorsController {
 
     const parts = [`created ${createdCount}`, `updated ${updatedCount}`];
     if (deprecated.length > 0) parts.push(`deprecated ${deprecated.length}`);
+    if (skipped.length > 0) parts.push(`skipped ${skipped.length}`);
+    if (renameConflicts.length > 0) {
+      this.logger.warn(
+        `Import into connector ${connectorId}: ${renameConflicts.length} tool(s) kept their name, the new one is used by another tool`,
+      );
+    }
     return {
       message: `Imported tools: ${parts.join(', ')}`,
       tools,
       created: createdCount,
       updated: updatedCount,
       deprecated,
-      // `skipped` kept for back-compat with clients that consumed the old
-      // shape; always empty under the new upsert strategy.
-      skipped: [] as string[],
+      skipped,
+      renameConflicts,
+      ...secrets.summary(),
     };
   }
 }

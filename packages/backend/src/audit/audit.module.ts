@@ -1,6 +1,8 @@
 import { Global, Module } from '@nestjs/common';
 import { AuditService } from './audit.service';
 import { AdsActivationService } from './ads-activation.service';
+import { AdsSignupService } from './ads-signup.service';
+import { FirstSuccessService } from './first-success.service';
 import { AuditController } from './audit.controller';
 import { SecurityEventService } from './security-event.service';
 import { ProductEventService } from './product-event.service';
@@ -12,7 +14,14 @@ import { AlertsModule } from '../alerts/alerts.module';
 @Module({
   imports: [AlertsModule],
   controllers: [AuditController, ProductEventController, SignupAttributionController],
-  providers: [AuditService, SecurityEventService, ProductEventService, AdsActivationService],
-  exports: [AuditService, SecurityEventService, ProductEventService],
+  providers: [
+    AuditService,
+    SecurityEventService,
+    ProductEventService,
+    AdsActivationService,
+    AdsSignupService,
+    FirstSuccessService,
+  ],
+  exports: [AuditService, SecurityEventService, ProductEventService, AdsSignupService],
 })
 export class AuditModule {}

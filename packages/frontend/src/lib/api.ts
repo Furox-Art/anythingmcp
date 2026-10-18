@@ -1,4 +1,5 @@
 import type { ClickIds, SignupAttribution } from './attribution';
+import type { CheckoutSource } from './checkout-source';
 
 // Use relative paths so requests go to the same origin.
 // In production (Docker / Railway) Next.js rewrites proxy /api/* to the backend.
@@ -24,6 +25,25 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * A fetch that rejects with a plain object instead of resolving with the
+ * response, e.g. `{ status: 401, error: true, body: { message } }`: what a
+ * browser extension wrapping `window.fetch` does (ANYTHINGMCP-CLOUD-FRONTEND-H,
+ * Safari). Callers tell a refused session from a network failure with
+ * `instanceof ApiError`, so such an object becomes one, with a stack.
+ * Anything else (a TypeError from the network, an AbortError) is returned
+ * as it is.
+ */
+export function asApiError(reason: unknown): unknown {
+  if (reason instanceof Error || typeof reason !== 'object' || reason === null) return reason;
+  const { status, body, message } = reason as { status?: unknown; body?: unknown; message?: unknown };
+  if (typeof status !== 'number') return reason;
+  const said = (body as { message?: unknown } | null | undefined)?.message;
+  const text =
+    typeof said === 'string' && said ? said : typeof message === 'string' && message ? message : `API error: ${status}`;
+  return new ApiError(text, status, body ?? null);
+}
+
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, token } = options;
 
@@ -35,20 +55,30 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  const response = await fetch(`${API_BASE}${path}`, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  // Auto-logout on 401 for authenticated requests, except when explicitly opting out
+  // (self-delete intentionally returns 401 for wrong password — let the caller handle it)
+  const signOutOn401 = (status: number) => {
+    if (status === 401 && token && !options.skipAutoLogout) {
+      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+    }
+  };
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (err) {
+    const error = asApiError(err);
+    if (error instanceof ApiError) signOutOn401(error.status);
+    throw error;
+  }
 
   if (!response.ok) {
     const errorBody = await response.json().catch(() => ({ message: response.statusText }));
-    // Auto-logout on 401 for authenticated requests, except when explicitly opting out
-    // (self-delete intentionally returns 401 for wrong password — let the caller handle it)
-    const skipAutoLogout = options.skipAutoLogout;
-    if (response.status === 401 && token && !skipAutoLogout) {
-      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
-    }
+    signOutOn401(response.status);
     const message = errorBody.message || errorBody.error || `API error: ${response.status}`;
     throw new ApiError(message, response.status, errorBody);
   }
@@ -283,6 +313,19 @@ export const mcpConnections = {
 
 // Connectors
 
+/**
+ * How an OAuth2 connector gets its access token. `authorization_code` signs in
+ * at the provider ("Authorize with Provider"); `client_credentials` and
+ * `password` ask the token endpoint with stored credentials, again whenever
+ * the token expires.
+ */
+export type OAuthGrant = 'authorization_code' | 'client_credentials' | 'password';
+
+/** True for the grants that need no sign-in at the provider. */
+export function isMachineGrant(grant: string | undefined): boolean {
+  return grant === 'client_credentials' || grant === 'password';
+}
+
 export interface CatalogBaseUrlChange {
   from: string;
   to: string;
@@ -310,9 +353,80 @@ export interface CatalogDiff {
   isSafeClass?: boolean;
 }
 
+/**
+ * Added by the server to a connector, tool or import answer when a secret
+ * typed into a URL, header or tool was moved into an encrypted variable
+ * (and referenced as {{VAR}}). Never carries the secret itself.
+ */
+export interface SecretMoveSummary {
+  secretsMoved?: Array<{ variable: string; field: string; kind: string; pattern: string }>;
+  renamedTools?: string[];
+  secretsNotice?: string;
+}
+
+/** `message`, followed by the server's note about moved secrets, if any. */
+export function withSecretsNotice(message: string, res: unknown): string {
+  const summary = (res ?? {}) as SecretMoveSummary;
+  const parts = [message];
+  if (summary.secretsNotice) parts.push(summary.secretsNotice);
+  if (summary.renamedTools?.length) {
+    parts.push(
+      `Renamed ${summary.renamedTools.length === 1 ? 'a tool whose name contained it' : 'tools whose names contained it'}: ${summary.renamedTools.join(', ')}.`,
+    );
+  }
+  return parts.filter(Boolean).join(' ');
+}
+
+/** Part of an import answer: tools that could not take the name the source gives them. */
+export interface ImportNameSummary {
+  /** Matched tools that kept their name because another tool already uses the new one. */
+  renameConflicts?: Array<{ toolId: string; kept: string; wanted: string }>;
+  /** Parsed tools not created because their name is already in use. */
+  skipped?: string[];
+}
+
+/**
+ * `withSecretsNotice`, plus a warning about tool names the import could not
+ * apply. The import itself succeeded; this only tells the admin why a tool
+ * kept its old name or was left out.
+ */
+export function withImportNotice(message: string, res: unknown): string {
+  const summary = (res ?? {}) as ImportNameSummary;
+  const parts = [withSecretsNotice(message, res)];
+  const conflicts = summary.renameConflicts ?? [];
+  if (conflicts.length) {
+    const list = conflicts.map((c) => `${c.kept} (wanted ${c.wanted})`).join(', ');
+    parts.push(
+      `Warning: ${conflicts.length === 1 ? 'one tool kept its name' : `${conflicts.length} tools kept their names`} because another tool already uses the new one: ${list}. Rename or delete the other tool and import again to apply it.`,
+    );
+  }
+  if (summary.skipped?.length) {
+    parts.push(
+      `Warning: not imported, the name is used twice: ${summary.skipped.join(', ')}.`,
+    );
+  }
+  return parts.join(' ');
+}
+
+export interface Connector {
+  id: string;
+  name: string;
+  type: string;
+  slug?: string;
+  baseUrl?: string;
+  isActive?: boolean;
+  authType?: string;
+  icon?: string | null;
+  setupStatus?: string;
+  missingVariables?: string[];
+  createdAt?: string;
+  updatedAt?: string;
+  [key: string]: unknown;
+}
+
 export const connectors = {
   list: (token: string) =>
-    request<any[]>('/api/connectors', { token }),
+    request<Connector[]>('/api/connectors', { token }),
   proxyAvailability: (token: string) =>
     request<{ available: boolean }>('/api/connectors/proxy-availability', { token }),
   /**
@@ -321,7 +435,7 @@ export const connectors = {
    * the caller had to remember.
    */
   create: (data: unknown, token: string) =>
-    request<any & { attachedToServer: { id: string; name: string } | null }>(
+    request<any & { attachedToServer: { id: string; name: string } | null } & SecretMoveSummary>(
       '/api/connectors',
       { method: 'POST', body: data, token },
     ),
@@ -342,16 +456,22 @@ export const connectors = {
       { method: 'POST', token },
     ),
   update: (id: string, data: unknown, token: string) =>
-    request(`/api/connectors/${id}`, { method: 'PUT', body: data, token }),
+    request<SecretMoveSummary>(`/api/connectors/${id}`, { method: 'PUT', body: data, token }),
   /** Non-secret OAuth2 settings, for pre-filling the edit form. */
   getOAuthConfig: (id: string, token: string) =>
     request<{
       clientId: string;
+      /** How tokens are obtained: a sign-in at the provider, or a machine grant. */
+      grant: OAuthGrant;
       authorizationUrl: string;
       tokenUrl: string;
       scopes: string;
       tokenAuthMethod: string;
+      /** Whether "Authorize with Provider" sends PKCE (on unless turned off). */
+      pkce: boolean;
       hasClientSecret: boolean;
+      hasUsername: boolean;
+      hasPassword: boolean;
       hasAccessToken: boolean;
       hasRefreshToken: boolean;
     }>(`/api/connectors/${id}/oauth-config`, { token }),
@@ -364,10 +484,14 @@ export const connectors = {
     data: {
       clientId?: string;
       clientSecret?: string;
+      grant?: OAuthGrant;
+      username?: string;
+      password?: string;
       authorizationUrl?: string;
       tokenUrl?: string;
       scopes?: string;
       tokenAuthMethod?: string;
+      pkce?: boolean;
     },
     token: string,
   ) =>
@@ -412,9 +536,9 @@ export const connectors = {
       suggestedFix?: { action: string; hostname?: string; url?: string };
     }>(`/api/connectors/${id}/test`, { method: 'POST', token }),
   importSpec: (id: string, token: string) =>
-    request<{ message: string; tools: any[] }>(`/api/connectors/${id}/import-spec`, { method: 'POST', token }),
+    request<{ message: string; tools: any[] } & SecretMoveSummary & ImportNameSummary>(`/api/connectors/${id}/import-spec`, { method: 'POST', token }),
   importTools: (id: string, data: { source: string; content?: string; url?: string }, token: string) =>
-    request<{ message: string; tools: any[]; skipped?: string[] }>(`/api/connectors/${id}/import`, { method: 'POST', body: data, token }),
+    request<{ message: string; tools: any[] } & SecretMoveSummary & ImportNameSummary>(`/api/connectors/${id}/import`, { method: 'POST', body: data, token }),
   // Secrets come back from the server empty and named in `maskedEnvVars`;
   // sending one back empty keeps its stored value.
   updateEnvVars: (id: string, envVars: Record<string, string>, token: string) =>
@@ -422,7 +546,7 @@ export const connectors = {
   exportAll: (token: string) =>
     request<{ version: string; exportedAt: string; secretsIncluded?: boolean; connectors: any[] }>('/api/connectors/export-all', { token }),
   importAll: (data: { connectors: any[] }, token: string) =>
-    request<{ message: string; created: number; skipped: number; tools: number; errors?: string[] }>('/api/connectors/import-all', { method: 'POST', body: data, token }),
+    request<{ message: string; created: number; skipped: number; tools: number; errors?: string[] } & SecretMoveSummary>('/api/connectors/import-all', { method: 'POST', body: data, token }),
   healthCheck: (token: string) =>
     request<{ total: number; healthy: number; unhealthy: number; connectors: any[] }>('/api/connectors/health-check', { token }),
   oauthAuthorize: (id: string, token: string, returnTo?: string) =>
@@ -439,7 +563,7 @@ export const connectors = {
   oauthRedirectUri: (token: string) =>
     request<{ redirectUri: string }>('/api/connectors/oauth/redirect-uri', { token }),
   discoverTools: (id: string, token: string) =>
-    request<{ message: string; tools: any[]; skipped?: string[]; error?: string }>(
+    request<{ message: string; tools: any[]; error?: string } & SecretMoveSummary & ImportNameSummary>(
       `/api/connectors/${id}/discover-tools`,
       { method: 'POST', token },
     ),
@@ -673,14 +797,14 @@ export const tools = {
   list: (connectorId: string, token: string) =>
     request<any[]>(`/api/connectors/${connectorId}/tools`, { token }),
   create: (connectorId: string, data: unknown, token: string) =>
-    request(`/api/connectors/${connectorId}/tools`, { method: 'POST', body: data, token }),
+    request<SecretMoveSummary>(`/api/connectors/${connectorId}/tools`, { method: 'POST', body: data, token }),
   bulkCreate: (connectorId: string, toolDefs: unknown[], token: string) =>
-    request<{ message: string; tools: any[]; skipped: string[] }>(
+    request<{ message: string; tools: any[]; skipped: string[] } & SecretMoveSummary>(
       `/api/connectors/${connectorId}/tools/bulk`,
       { method: 'POST', body: { tools: toolDefs }, token },
     ),
   update: (connectorId: string, toolId: string, data: unknown, token: string) =>
-    request(`/api/connectors/${connectorId}/tools/${toolId}`, { method: 'PUT', body: data, token }),
+    request<SecretMoveSummary>(`/api/connectors/${connectorId}/tools/${toolId}`, { method: 'PUT', body: data, token }),
   setProxy: (connectorId: string, toolId: string, useProxy: boolean, token: string) =>
     request<any>(`/api/connectors/${connectorId}/tools/${toolId}/proxy`, {
       method: 'PATCH',
@@ -1011,12 +1135,18 @@ export const publicStats = {
 export const siteSettings = {
   footerLinks: () =>
     request<Array<{ label: string; url: string }>>('/api/site-settings/footer-links'),
+  /** The signed-in member's workspace links (instance-wide ones as fallback). */
+  workspaceFooterLinks: (token: string) =>
+    request<Array<{ label: string; url: string }>>('/api/settings/footer-links', { token }),
 };
 
 export const versionApi = {
   get: (token: string) =>
     request<{ version: string; commit: string; buildDate: string | null; deploymentMode: string }>('/api/version', { token, skipAutoLogout: true }),
 };
+
+/** Fired after an admin saves the footer links, so the footer reloads them. */
+export const FOOTER_LINKS_CHANGED = 'amcp:footer-links-changed';
 
 // Admin Settings
 export const adminSettings = {
@@ -1360,6 +1490,11 @@ export const license = {
       trialDaysLeft?: number;
       /** Cloud, paid licences: the Stripe subscription's state. */
       billing?: LicenseBilling;
+      /**
+       * Cloud: the paid licence stopped because a card was declined, and
+       * Stripe is still retrying the subscription. Fixed with a new card.
+       */
+      paymentFailed?: boolean;
     }>('/api/license/status', { token }),
   /** Re-verify now (cloud, admin); at most once a minute per workspace. */
   refresh: (token: string) =>
@@ -1385,7 +1520,8 @@ export const license = {
       method: 'POST',
       token,
     }),
-  billingPortal: (token: string, returnUrl?: string, flow?: 'cancel') =>
+  /** 'cancel' opens Stripe's cancellation page, 'payment_method_update' the page to add a card. */
+  billingPortal: (token: string, returnUrl?: string, flow?: 'cancel' | 'payment_method_update') =>
     request<{ url: string }>('/api/license/billing-portal', {
       method: 'POST',
       body: { returnUrl, ...(flow && { flow }) },
@@ -1403,13 +1539,41 @@ export const license = {
       billingPeriod: 'monthly' | 'yearly';
       trial: boolean;
       promo?: string;
+      /** Where in the app the checkout started; reaches Stripe as metadata.checkout_source. */
+      source?: CheckoutSource;
     },
   ) =>
-    request<{ url: string }>('/api/license/checkout-link', {
+    /** `trial`: whether the licence site granted the card trial asked for. */
+    request<{ url: string; trial?: boolean }>('/api/license/checkout-link', {
       method: 'POST',
       body,
       token,
     }),
+  /**
+   * Cloud: the signed-in user's address token for pricing links (`#t=`), so
+   * the pricing page knows who is buying. Null when the server has none.
+   */
+  pricingLinkToken: (token: string) =>
+    request<{ token: string | null }>('/api/license/pricing-link-token', { token, skipAutoLogout: true }),
+  /**
+   * Cloud (ADMIN): can this address start a card trial? 'pay' = it had a
+   * subscription before, so a plan starts and is billed today.
+   */
+  cardTrialEligibility: (token: string) =>
+    request<{ kind: 'trial' | 'pay' | 'none'; trialEndsAt: string | null }>(
+      '/api/license/card-trial-eligibility',
+      { token },
+    ),
+  /**
+   * Cloud: the card-trial offer after the workspace's first successful tool
+   * call. Null unless the caller is an admin of an eligible workspace with a
+   * card trial still possible (48 hours of free trial left).
+   */
+  cardTrialOffer: (token: string) =>
+    request<{ offer: { connectorName: string | null; trialEndsAt: string } | null }>(
+      '/api/license/card-trial-offer',
+      { token },
+    ),
   getInstanceId: () =>
     request<{ instanceId: string }>('/api/license/instance-id'),
   getUsage: (token?: string) =>
@@ -1422,10 +1586,25 @@ export const license = {
     }>('/api/license/usage', { token }),
 };
 
+export interface McpServer {
+  id: string;
+  name: string;
+  slug?: string;
+  description?: string;
+  instructions?: string;
+  isActive?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+  usage?: { calls30d: number; lastCallAt: string | null };
+  _count?: { connectors: number; apiKeys: number };
+  connectors?: Array<{ connector: { name: string } }>;
+  [key: string]: unknown;
+}
+
 // MCP Servers
 export const mcpServers = {
   list: (token: string) =>
-    request<any[]>('/api/mcp-servers', { token }),
+    request<McpServer[]>('/api/mcp-servers', { token }),
   get: (id: string, token: string) =>
     request<any>(`/api/mcp-servers/${id}`, { token }),
   /** Calls in the last 30 days and the last one's time (the connect page's live check). */
