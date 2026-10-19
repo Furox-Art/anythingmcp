@@ -532,7 +532,7 @@ export default function SettingsAdminPage() {
       </Card>
 
       {/* About this instance */}
-      <Card>
+      <Card className="p-[22px]">
         <h3 className="text-sm font-semibold text-[var(--text)] mb-2">About this instance</h3>
         {!versionInfo && (
           <p className="text-sm text-[var(--text-3)]">Version info unavailable.</p>
