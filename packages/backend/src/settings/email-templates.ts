@@ -14,6 +14,8 @@ import {
   steps,
   usageBox,
 } from './email-layout';
+import { withEmailLinkToken } from '../common/email-link-token';
+import { withSourceParam } from '../license/license-checkout';
 
 /**
  * Every email the backend sends, as pure functions of their inputs: no
@@ -137,6 +139,39 @@ export function invitationEmail(
       `Accept the invitation: ${input.inviteUrl}\n` +
       `It expires in 48 hours.\n\n` +
       `Weren't expecting this? You can ignore this email; nothing happens without you.`,
+    ctx,
+  });
+}
+
+/**
+ * A connector stopped working because the provider refused its credential for
+ * good (a refresh token refused, a Meta session logged out). Sent once to the
+ * workspace owner; calls fail fast until the credential is replaced, so
+ * nothing else would tell them. Transactional: no unsubscribe line.
+ */
+export function connectorAuthEmail(
+  input: { name: string | null; connectorName: string; message: string; connectorUrl: string },
+  ctx: EmailBrandContext,
+): RenderedEmail {
+  const hi = greeting(input.name);
+  const connector = input.connectorName.trim() || 'A connector';
+  return build({
+    subject: `${connector} needs a new sign-in`,
+    preheader: 'Your AI client cannot use it until you authorize it again.',
+    bodyHtml:
+      h1('A connector needs a new sign-in.', 'Your AI client cannot use it until then.') +
+      p(
+        `${esc(hi)} the provider behind <strong style="font-weight:600;">${esc(connector)}</strong> refused its credential, ` +
+          'so AnythingMCP stopped retrying and every tool call now answers with what to do instead.',
+      ) +
+      p(esc(input.message)) +
+      button(input.connectorUrl, 'Open the connector') +
+      small('This is the only email about it. Once you sign in again, the connector works as before.'),
+    bodyText:
+      `${hi}\n\nThe provider behind "${connector}" refused its credential, so AnythingMCP stopped retrying and every tool call now answers with what to do instead.\n\n` +
+      `${input.message}\n\n` +
+      `Open the connector: ${input.connectorUrl}\n\n` +
+      'This is the only email about it. Once you sign in again, the connector works as before.',
     ctx,
   });
 }
@@ -291,11 +326,24 @@ export function trialLifecycleEmail(
     recap: { connectors: number; successfulCalls: number; daysLeft: number };
     cloudUrl: string;
     marketingUrl: string;
+    /**
+     * The recipient's address token (common/email-link-token.ts), so the
+     * pricing page knows who buys and refuses a second subscription.
+     */
+    emailToken?: string | null;
   },
   ctx: EmailBrandContext,
 ): RenderedEmail {
   const { stage, recap, cloudUrl } = input;
-  const pricingUrl = `${input.marketingUrl}/pricing?return_url=${encodeURIComponent(`${cloudUrl}/settings/license/activate`)}`;
+  // `source` reaches the checkout's Stripe metadata (checkout_source), so a
+  // purchase from this email can be told apart from the pricing page's own.
+  const pricingUrl = withEmailLinkToken(
+    withSourceParam(
+      `${input.marketingUrl}/pricing?return_url=${encodeURIComponent(`${cloudUrl}/settings/license/activate`)}`,
+      `email_trial_${stage}`,
+    ),
+    input.emailToken,
+  );
   const licenseUrl = `${cloudUrl}/settings/license`;
   const hi = greeting(input.name);
   const days = Math.max(0, Math.round(recap.daysLeft));
@@ -434,11 +482,21 @@ export type WinbackOffer =
 const dayAndMonth = (d: Date) => d.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', timeZone: 'UTC' });
 
 export function trialWinbackEmail(
-  input: { name: string; offer: WinbackOffer; cloudUrl: string; marketingUrl: string },
+  input: {
+    name: string;
+    offer: WinbackOffer;
+    cloudUrl: string;
+    marketingUrl: string;
+    /** The recipient's address token for the pricing links (see trialLifecycleEmail). */
+    emailToken?: string | null;
+  },
   ctx: MarketingContext,
 ): RenderedEmail {
   const { offer, cloudUrl, marketingUrl } = input;
   const returnUrl = encodeURIComponent(`${cloudUrl}/settings/license/activate`);
+  // Every pricing link carries `source=email_winback` into the checkout's
+  // Stripe metadata; the promo code already tells the offers apart.
+  const priced = (url: string) => withEmailLinkToken(withSourceParam(url, 'email_winback'), input.emailToken);
   const hi = greeting(input.name);
   const endedOn = dayAndMonth(offer.trialEndedAt);
   const replyLine = 'Not the right time, or something was missing? Reply and tell us; we read every answer.';
@@ -451,7 +509,7 @@ export function trialWinbackEmail(
   if (offer.kind === 'firstMonth') {
     const price = esc(offer.price);
     const regular = esc(offer.regularPrice);
-    const pricingUrl = `${marketingUrl}/pricing?promo=${encodeURIComponent(offer.promoCode)}&return_url=${returnUrl}`;
+    const pricingUrl = priced(`${marketingUrl}/pricing?promo=${encodeURIComponent(offer.promoCode)}&return_url=${returnUrl}`);
     return build({
       subject: `Your first month of AnythingMCP Cloud for ${offer.price}`,
       preheader: `Your workspace is still there. Cloud Starter for ${offer.price} the first month, then ${offer.regularPrice}/month.`,
@@ -478,7 +536,7 @@ export function trialWinbackEmail(
 
   if (offer.kind === 'discount') {
     const percent = Math.round(offer.percentOff);
-    const pricingUrl = `${marketingUrl}/pricing?promo=${encodeURIComponent(offer.promoCode)}&return_url=${returnUrl}`;
+    const pricingUrl = priced(`${marketingUrl}/pricing?promo=${encodeURIComponent(offer.promoCode)}&return_url=${returnUrl}`);
     const ended = offer.stage === 'first' ? `ended on ${endedOn}` : 'ended a month ago';
     return build({
       subject:
@@ -503,7 +561,7 @@ export function trialWinbackEmail(
     });
   }
 
-  const pricingUrl = `${marketingUrl}/pricing?return_url=${returnUrl}`;
+  const pricingUrl = priced(`${marketingUrl}/pricing?return_url=${returnUrl}`);
   const connectorsUrl = `${cloudUrl}/connectors`;
   const mcpUrl = `${cloudUrl}/mcp`;
   return build({

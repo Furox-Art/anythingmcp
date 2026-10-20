@@ -64,6 +64,33 @@ describe('POST /api/product-events — catalog searches', () => {
   });
 });
 
+describe('POST /api/product-events — /start-trial funnel', () => {
+  it('keeps the source the page was opened from on both events', async () => {
+    const { controller, req, stored } = build();
+    await controller.record(req, {
+      event: 'start_trial_viewed',
+      metadata: { source: 'first_success_banner', kind: 'trial' },
+    });
+    await controller.record(req, {
+      event: 'start_trial_checkout_started',
+      metadata: { source: 'trial_ended_wall', kind: 'pay' },
+    });
+    expect(stored().map((e: any) => [e.event, e.metadata])).toEqual([
+      ['start_trial_viewed', { kind: 'trial', source: 'first_success_banner' }],
+      ['start_trial_checkout_started', { kind: 'pay', source: 'trial_ended_wall' }],
+    ]);
+  });
+
+  it('drops a source that is not a known checkout entry point', async () => {
+    const { controller, req, stored } = build();
+    await controller.record(req, {
+      event: 'start_trial_viewed',
+      metadata: { source: 'me@corp.de', kind: 'trial' },
+    });
+    expect(stored()[0].metadata).toEqual({ kind: 'trial' });
+  });
+});
+
 describe('scrubProviderMessage', () => {
   it('drops query strings, masks given secrets and token-like runs, caps the length', () => {
     expect(scrubProviderMessage('GET https://x.example/api?appid=abc failed', [])).toBe('GET https://x.example/api failed');
@@ -71,6 +98,28 @@ describe('scrubProviderMessage', () => {
     expect(scrubProviderMessage(`token ${'a1'.repeat(20)} expired`)).toBe('token *** expired');
     expect(scrubProviderMessage('x'.repeat(30) + ' ' + 'word '.repeat(60))!.length).toBe(160);
     expect(scrubProviderMessage('   ')).toBeNull();
+  });
+
+  it('cuts a URL at its first ? or #, wherever it sits in the text', () => {
+    expect(scrubProviderMessage('see "https://a.example/x#frag" and http://b.example/y?k=v&z=1 now')).toBe(
+      'see "https://a.example/x" and http://b.example/y now',
+    );
+    expect(scrubProviderMessage('plain https://c.example/path, done')).toBe('plain https://c.example/path, done');
+  });
+
+  it('masks a secret that straddles the part the regexes read', () => {
+    const secret = 'zz-secret-value';
+    // Cut first, mask after, and "zz-secret-" would survive the 2000-character cut.
+    expect(scrubProviderMessage(`${' '.repeat(1990)}${secret} given`, [secret])).toBe('*** given');
+  });
+
+  it('stays fast on a long crafted input (CodeQL js/polynomial-redos)', () => {
+    for (const input of ['http://'.repeat(50_000), `${'http://a'.repeat(20_000)}?`, 'a'.repeat(31).concat(' ').repeat(10_000)]) {
+      const started = Date.now();
+      const out = scrubProviderMessage(input);
+      expect(Date.now() - started).toBeLessThan(200);
+      expect(out!.length).toBeLessThanOrEqual(160);
+    }
   });
 });
 

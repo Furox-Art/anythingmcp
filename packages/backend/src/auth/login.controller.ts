@@ -21,6 +21,8 @@ import {
 } from './auth.service';
 import { PrismaService } from '../common/prisma.service';
 import { DeploymentService } from '../common/deployment.service';
+import { findUserByEmail } from '../common/email.util';
+import type { User } from '../generated/prisma/client';
 import { PrismaOAuthStore } from './prisma-oauth.store';
 import { SsoService } from '../identity-providers/sso.service';
 import { MCP_RESOURCE_COOKIE } from './resource-indicator.middleware';
@@ -29,6 +31,7 @@ import { McpConnectionGrantService } from '../mcp-servers/mcp-connection-grant.s
 import { ProductEvents, ProductEventService } from '../audit/product-event.service';
 import { LicenseGuardService } from '../license/license-guard.service';
 import { CardTrialEligibilityService } from '../license/card-trial-eligibility.service';
+import { POST_APPROVE_SOURCE } from '../license/license-checkout';
 import {
   AMCP_MARK_SVG as AMCP_MARK,
   claudeMark,
@@ -269,10 +272,9 @@ export class LoginController {
       );
     }
 
-    // Find user by email
-    const user = await this.prisma.user.findUnique({
-      where: { email },
-    });
+    // Find user by email, in any case: an address registered with capitals
+    // must still sign in when typed in lower case, and the other way round.
+    const user = await findUserByEmail<User>(this.prisma, email);
 
     if (!user) {
       this.logger.warn(`Login attempt for non-existent user: ${email}`);
@@ -446,7 +448,7 @@ export class LoginController {
         redirectHost: consent.redirectHost,
         callbackUrl,
         welcomeUrl: `${dashboard}/welcome`,
-        ...(trialEndsAt ? { cardTrial: { endsAt: trialEndsAt, url: `${dashboard}/start-trial` } } : {}),
+        ...(trialEndsAt ? { cardTrial: { endsAt: trialEndsAt, url: `${dashboard}/start-trial?source=${POST_APPROVE_SOURCE}` } } : {}),
       }),
     );
     return true;

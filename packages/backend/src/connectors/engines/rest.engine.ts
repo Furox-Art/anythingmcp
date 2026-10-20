@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import {
   AxiosRequestConfig,
   AxiosResponse,
@@ -8,8 +8,11 @@ import {
 import { createHmac } from 'node:crypto';
 import FormData from 'form-data';
 import { createUnblockerProxyAgent } from './unblocker-proxy-agent';
+import { decodeResponseBody } from '../binary-response.util';
 import { buildOAuth1Header } from './oauth1-signer';
 import { OAuth2TokenService } from './oauth2-token.service';
+import { BearerTokenRenewalService } from './bearer-token-renewal.service';
+import { ShopeeTokenService, isShopeeAccessTokenRejected, isShopeeAuth } from './shopee-token.service';
 import { canRenewToken } from '../oauth-grant.util';
 import {
   LoginTokenService,
@@ -88,6 +91,8 @@ export class RestEngine {
   constructor(
     private readonly oauth2TokenService: OAuth2TokenService,
     private readonly loginTokenService: LoginTokenService,
+    @Optional() private readonly bearerTokens?: BearerTokenRenewalService,
+    @Optional() private readonly shopeeTokens?: ShopeeTokenService,
   ) {}
 
   /**
@@ -144,6 +149,11 @@ export class RestEngine {
       // Response headers to hand back alongside the body, e.g. ["link"] for
       // cursor pagination. Opt-in per tool; see response-headers.util.ts.
       exposeHeaders?: string[];
+      // How a space in a query value goes on the wire: `+` (the default,
+      // what every connector has always sent) or `%20`. Set only by the
+      // OData engine for a connector with `config.odata.querySpaces: "%20"`
+      // (1C:Enterprise answers 400 to `+` inside $filter).
+      querySpaces?: '%20';
       // Hand back an XML body as the text it arrived as instead of parsing
       // it into an object. The OData engine needs `$metadata` verbatim.
       rawBody?: boolean;
@@ -244,6 +254,11 @@ export class RestEngine {
         ...resolvedEndpointHeaders,
       },
       timeout: 30000,
+      // The bytes as they arrived: a text body is decoded and parsed as axios
+      // always did, a file (image, PDF, …) becomes a BinaryBody instead of a
+      // string of replacement characters. See binary-response.util.ts.
+      responseType: 'arraybuffer',
+      transformResponse: [(data: unknown, headers?: unknown) => decodeResponseBody(data, headers)],
     };
     // A form-data body is a one-shot stream: every send (a retry, a redirect
     // that keeps the body) needs a fresh one, built by this.
@@ -287,7 +302,10 @@ export class RestEngine {
       // most standards-following APIs actually parse. The bracketed form is
       // silently ignored by them, so the request succeeds and quietly
       // returns the wrong columns. Serialize the standard way instead.
-      axiosConfig.paramsSerializer = serializeRepeatedParams;
+      axiosConfig.paramsSerializer =
+        endpointMapping.querySpaces === '%20'
+          ? serializeRepeatedParamsSpaces20
+          : serializeRepeatedParams;
     }
 
     // Request body
@@ -455,8 +473,12 @@ export class RestEngine {
 
     // HMAC signing is here for the same reason: the canonical string most
     // of these APIs sign folds in the request body, which does not exist
-    // until the block above has run.
-    this.applyHmacSignature(axiosConfig, config);
+    // until the block above has run. A Shopee connector also signs the
+    // shop's access token and id (undefined for every other connector).
+    const hmacCredentials = isShopeeAuth(config.authType, config.authConfig)
+      ? await this.shopeeShopParams(config)
+      : undefined;
+    this.applyHmacSignature(axiosConfig, config, hmacCredentials);
     for (const h of headerNames(axiosConfig.headers)) {
       if (!headersBeforeSigning.includes(h)) credentialHeaders.add(h);
     }
@@ -526,11 +548,35 @@ export class RestEngine {
         const bundle = await this.loginTokenService.forceRelogin(
           authConfig,
           config.connectorId,
+          { proxyUrl: config.proxyUrl },
         );
         injectLoginTokenHeaders(axiosConfig, authConfig, bundle.token, bundle.aud);
         rebuildBody(axiosConfig, buildBody);
         const retryResponse = await outboundRequest(axiosConfig, outbound);
         return withMeta(retryResponse);
+      }
+      // Shopee refused the shop's access token (expired early, or replaced
+      // by another process's renewal): renew once, sign again, resend.
+      if (hmacCredentials && this.shopeeTokens && isShopeeAccessTokenRejected(error)) {
+        const renewed = await this.shopeeTokens.renewAfterRejection(config, sentAt);
+        if (renewed) {
+          this.applyHmacSignature(axiosConfig, config, renewed);
+          rebuildBody(axiosConfig, buildBody);
+          return withMeta(await outboundRequest(axiosConfig, outbound));
+        }
+      }
+      // A pasted token the provider ended for good (Meta 190 logged out,
+      // expired, password changed): mark the connector, stop sending it,
+      // and say what to do next to the vendor's own error.
+      if (
+        error instanceof AxiosError &&
+        error.response &&
+        config.authType === 'BEARER_TOKEN' &&
+        this.bearerTokens &&
+        config.authConfig?.tokenRenewal
+      ) {
+        const hint = await this.bearerTokens.onRejected(config.authConfig, config.connectorId, error);
+        if (hint) (error as AxiosError & { hint?: string }).hint = hint;
       }
       throw restateProxyError(error);
     }
@@ -683,6 +729,7 @@ export class RestEngine {
       authType: string;
       authConfig?: Record<string, unknown>;
       connectorId?: string;
+      proxyUrl?: string;
     },
   ): Promise<void> {
     if (!config.authConfig) return;
@@ -707,12 +754,19 @@ export class RestEngine {
         }
         break;
       }
-      case 'BEARER_TOKEN':
+      case 'BEARER_TOKEN': {
+        // A token the adapter can renew (authConfig.tokenRenewal, see
+        // bearer-token-renewal.service.ts) may be swapped for a long-lived one.
+        const token =
+          this.bearerTokens && config.authConfig.tokenRenewal
+            ? await this.bearerTokens.getToken(config.authConfig, config.connectorId)
+            : config.authConfig.token;
         axiosConfig.headers = {
           ...axiosConfig.headers,
-          Authorization: `Bearer ${config.authConfig.token}`,
+          Authorization: `Bearer ${token}`,
         };
         break;
+      }
       case 'BASIC_AUTH':
         // An empty password is a real configuration, not a missing one:
         // Companies House (and other key-as-username APIs) want exactly
@@ -759,6 +813,7 @@ export class RestEngine {
         const bundle = await this.loginTokenService.getToken(
           config.authConfig as unknown as LoginTokenAuthConfig,
           config.connectorId,
+          { proxyUrl: config.proxyUrl },
         );
         injectLoginTokenHeaders(
           axiosConfig,
@@ -804,10 +859,26 @@ export class RestEngine {
    *   signature.timestampHeader  optional; receives the same timestamp that
    *                        went into the string, so the server can recompute it
    *   signature.extraHeaders     static headers sent alongside (e.g. a client key)
+   *
+   * Query signing, opt-in (Shopee Open Platform). None of these fields is set
+   * on an adapter written before them, and without them the code below runs
+   * exactly as it always has (rest.engine.hmac-pin.spec.ts pins it):
+   *   signature.placement       'header' (default) | 'query': the digest goes
+   *                             into the query parameter `paramName` instead
+   *   signature.paramName       default 'sign'
+   *   signature.timestampParam  sends the timestamp as this query parameter
+   *   signature.queryParams     static query parameters added to every call
+   *                             (a partner id), signed like the others
+   *   template variables        `${pathname}` (path without the query) and
+   *                             `${query.NAME}` (the value of a query
+   *                             parameter as sent, '' when absent)
+   * `credentialParams` are query parameters a token provider adds (Shopee's
+   * access_token and shop_id); they win over a tool's own parameters.
    */
   private applyHmacSignature(
     axiosConfig: AxiosRequestConfig,
     config: { authType: string; authConfig?: Record<string, unknown> },
+    credentialParams?: Record<string, string>,
   ): void {
     if (config.authType !== 'HMAC' || !config.authConfig) return;
     const sig = config.authConfig.signature as Record<string, unknown> | undefined;
@@ -818,6 +889,26 @@ export class RestEngine {
     const secret = String(sig.secret ?? '');
     const headerName = String(sig.headerName ?? 'Signature');
     const timestamp = String(Math.floor(Date.now() / 1000));
+
+    const extended = usesExtendedHmac(sig, credentialParams);
+    if (extended) {
+      // Static and credential parameters first, so the query below (and the
+      // signature over it) includes them. A tool's own parameter of the same
+      // name cannot replace a credential.
+      const added: Record<string, unknown> = {};
+      const statics = sig.queryParams;
+      if (statics && typeof statics === 'object' && !Array.isArray(statics)) {
+        for (const [k, v] of Object.entries(statics as Record<string, unknown>)) {
+          if (v !== undefined && v !== null) added[k] = String(v);
+        }
+      }
+      Object.assign(added, credentialParams ?? {});
+      if (sig.timestampParam) added[String(sig.timestampParam)] = timestamp;
+      // A retry signs again: the previous signature is not part of the query.
+      const previous = { ...((axiosConfig.params as Record<string, unknown>) ?? {}) };
+      if (String(sig.placement ?? 'header') === 'query') delete previous[String(sig.paramName ?? 'sign')];
+      axiosConfig.params = { ...previous, ...added };
+    }
 
     // The body as it will actually go out. An object body is serialized the
     // way axios will serialize it, so the bytes signed are the bytes sent —
@@ -851,19 +942,38 @@ export class RestEngine {
 
     // Kaufland's documented string: the four parts joined by newlines, with
     // no newline after the timestamp.
-    const canonical = String(sig.template ?? '${method}\n${url}\n${body}\n${timestamp}')
-      .replace(/\\n/g, '\n')
-      .replace(/\$\{method\}/g, String(axiosConfig.method ?? 'GET').toUpperCase())
-      .replace(/\$\{url\}/g, url)
-      .replace(/\$\{path\}/g, path)
-      .replace(/\$\{body\}/g, body)
-      .replace(/\$\{timestamp\}/g, timestamp);
+    const canonical = extended
+      ? renderExtendedHmacTemplate(String(sig.template ?? '${method}\n${url}\n${body}\n${timestamp}'), {
+          method: String(axiosConfig.method ?? 'GET').toUpperCase(),
+          url,
+          path,
+          pathname: pathnameOf(url),
+          body,
+          timestamp,
+          query: params,
+        })
+      : String(sig.template ?? '${method}\n${url}\n${body}\n${timestamp}')
+          .replace(/\\n/g, '\n')
+          .replace(/\$\{method\}/g, String(axiosConfig.method ?? 'GET').toUpperCase())
+          .replace(/\$\{url\}/g, url)
+          .replace(/\$\{path\}/g, path)
+          .replace(/\$\{body\}/g, body)
+          .replace(/\$\{timestamp\}/g, timestamp);
 
     const digest = createHmac(algorithm, secret)
       .update(canonical, 'utf8')
       .digest(encoding as 'hex' | 'base64');
 
     const extra = (sig.extraHeaders as Record<string, string> | undefined) ?? {};
+    if (extended && String(sig.placement ?? 'header') === 'query') {
+      axiosConfig.params = { ...params, [String(sig.paramName ?? 'sign')]: digest };
+      axiosConfig.paramsSerializer = serializeRepeatedParams;
+      axiosConfig.headers = { ...axiosConfig.headers, ...extra };
+      if (sig.timestampHeader) {
+        (axiosConfig.headers as Record<string, string>)[String(sig.timestampHeader)] = timestamp;
+      }
+      return;
+    }
     axiosConfig.headers = {
       ...axiosConfig.headers,
       ...extra,
@@ -874,6 +984,25 @@ export class RestEngine {
         String(sig.timestampHeader)
       ] = timestamp;
     }
+  }
+
+  /**
+   * The shop parameters a Shopee call signs and sends (`access_token`,
+   * `shop_id`), renewed first when the token is about to expire. Undefined
+   * for every connector that is not `authType: HMAC` with
+   * `authConfig.tokenProvider: "shopee"`.
+   */
+  private async shopeeShopParams(config: {
+    baseUrl: string;
+    authType: string;
+    authConfig?: Record<string, unknown>;
+    connectorId?: string;
+  }): Promise<Record<string, string> | undefined> {
+    if (!isShopeeAuth(config.authType, config.authConfig)) return undefined;
+    if (!this.shopeeTokens) {
+      throw new Error('Shopee connectors need the Shopee token service, which is not available here.');
+    }
+    return this.shopeeTokens.getShopParams(config);
   }
 
   private applyOAuth1Signature(
@@ -1044,12 +1173,71 @@ function safeEntries(params: URLSearchParams): Record<string, string> {
  * date, time or filter query parameter, and an API that string-matches its
  * own filter grammar is entitled to reject the re-spelled form.
  */
-function encodeQueryComponent(value: string): string {
-  return encodeURIComponent(value)
+function encodeQueryComponent(value: string, spaces: '+' | '%20' = '+'): string {
+  const encoded = encodeURIComponent(value)
     .replace(/%3A/gi, ':')
     .replace(/%24/g, '$')
-    .replace(/%2C/gi, ',')
-    .replace(/%20/g, '+');
+    .replace(/%2C/gi, ',');
+  // `%20` is opt-in (see `querySpaces`); a literal `+` in a value is still
+  // `%2B` either way.
+  return spaces === '%20' ? encoded : encoded.replace(/%20/g, '+');
+}
+
+/**
+ * Whether an HMAC signature uses the query-signing options (see
+ * applyHmacSignature). False for every adapter written before them, which
+ * keeps them on the original code path.
+ */
+export function usesExtendedHmac(
+  sig: Record<string, unknown>,
+  credentialParams?: Record<string, string>,
+): boolean {
+  return (
+    sig.placement !== undefined ||
+    sig.paramName !== undefined ||
+    sig.timestampParam !== undefined ||
+    sig.queryParams !== undefined ||
+    credentialParams !== undefined
+  );
+}
+
+/** The path of a URL without its query; the input as given when it is relative. */
+function pathnameOf(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    const q = url.indexOf('?');
+    return q === -1 ? url : url.slice(0, q);
+  }
+}
+
+/**
+ * The canonical string of an extended HMAC template, in one pass: a value
+ * substituted for one variable is never read again as another (an access
+ * token cannot smuggle in `${body}`).
+ */
+export function renderExtendedHmacTemplate(
+  template: string,
+  vars: {
+    method: string;
+    url: string;
+    path: string;
+    pathname: string;
+    body: string;
+    timestamp: string;
+    query: Record<string, unknown>;
+  },
+): string {
+  return template
+    .replace(/\\n/g, '\n')
+    .replace(/\$\{(method|url|path|pathname|body|timestamp|query\.([^{}]+))\}/g, (_m, name: string, q?: string) => {
+      if (q !== undefined) {
+        const v = vars.query[q];
+        if (v === undefined || v === null) return '';
+        return Array.isArray(v) ? v.map(String).join(',') : String(v);
+      }
+      return String(vars[name as Exclude<keyof typeof vars, 'query'>]);
+    });
 }
 
 /**
@@ -1074,11 +1262,28 @@ function encodeQueryComponent(value: string): string {
 export function serializeRepeatedParams(
   params: Record<string, unknown>,
 ): string {
+  return serializeParams(params, '+');
+}
+
+/**
+ * serializeRepeatedParams with a space written as `%20` instead of `+`. Only
+ * used for a request that asks for it (`querySpaces: '%20'`).
+ */
+export function serializeRepeatedParamsSpaces20(
+  params: Record<string, unknown>,
+): string {
+  return serializeParams(params, '%20');
+}
+
+function serializeParams(
+  params: Record<string, unknown>,
+  spaces: '+' | '%20',
+): string {
   const parts: string[] = [];
   const push = (key: string, value: unknown) => {
     if (value === undefined || value === null) return;
     parts.push(
-      `${encodeQueryComponent(key)}=${encodeQueryComponent(String(value))}`,
+      `${encodeQueryComponent(key, spaces)}=${encodeQueryComponent(String(value), spaces)}`,
     );
   };
   // Every level below the top one is indexed: `k[0]`, `k[name]`.

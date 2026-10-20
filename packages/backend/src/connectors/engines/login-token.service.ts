@@ -7,9 +7,59 @@ import { encrypt, decrypt } from '../../common/crypto/encryption.util';
 import { getRequiredSecret } from '../../common/secrets.util';
 import { assertSafeOutboundUrl } from '../../common/ssrf.util';
 import { outboundAxiosOptions } from '../../common/outbound-http';
+import { createUnblockerProxyAgent } from './unblocker-proxy-agent';
 
 const DEFAULT_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 const DEFAULT_PROACTIVE_REFRESH_SECONDS = 24 * 60 * 60; // 1 day
+// The early-refresh window never takes more than this share of a token's
+// lifetime, so a short-lived token is still reused for most of its life.
+const PROACTIVE_REFRESH_LIFETIME_FRACTION = 0.2;
+// ...but never less than this, so a token is not sent seconds before it dies
+// (clock skew, slow upstream). Halved for tokens that live under a minute.
+const MIN_PROACTIVE_REFRESH_MS = 30 * 1000;
+// After a proactive re-login fails, keep serving the still-valid token for this
+// long before trying again, instead of hitting the vendor's login on every call.
+const PROACTIVE_RETRY_BACKOFF_MS = 30 * 1000;
+
+/**
+ * How the login request travels. A tool routed through the connector proxy
+ * (`use_proxy`) passes its proxy here, so the login leaves from the same
+ * address as the call it authorises: a vendor that blocks the server's IP
+ * (Playtomic answers its login with a 403 page) blocks the login as well.
+ */
+export interface LoginRequestOptions {
+  proxyUrl?: string;
+}
+
+/**
+ * How long before `expiresAt` a token counts as due for renewal.
+ *
+ * The configured window (`proactiveRefreshSeconds`, default 24h) suits tokens
+ * that live for weeks. Applied as-is to a token that lives one hour, every
+ * token is "near expiry" the moment it is issued and each call logs in again:
+ * a Supabase connector made one password grant per tool call that way, and
+ * Supabase rate-limited a third of them. So the window is capped at a fifth of
+ * the token's lifetime, with a 30 s floor (half the lifetime below a minute).
+ * Tokens that live five days or more keep the configured window unchanged.
+ *
+ * Without `obtainedAt` the lifetime is unknown and the configured window is
+ * used, as before.
+ */
+export function proactiveRefreshWindowMs(
+  bundle: Pick<LoginTokenBundle, 'expiresAt' | 'obtainedAt'>,
+  proactiveRefreshSeconds?: number,
+): number {
+  const configuredMs =
+    (proactiveRefreshSeconds ?? DEFAULT_PROACTIVE_REFRESH_SECONDS) * 1000;
+  if (!bundle.obtainedAt) return configuredMs;
+  const lifetimeMs = bundle.expiresAt - bundle.obtainedAt;
+  if (!(lifetimeMs > 0)) return configuredMs;
+  const relativeMs = Math.max(
+    lifetimeMs * PROACTIVE_REFRESH_LIFETIME_FRACTION,
+    Math.min(MIN_PROACTIVE_REFRESH_MS, lifetimeMs / 2),
+  );
+  return Math.min(configuredMs, relativeMs);
+}
 
 export interface LoginTokenAuthConfig {
   loginUrl: string;
@@ -71,6 +121,10 @@ export interface LoginTokenBundle {
   token: string;
   aud?: string;
   expiresAt: number; // epoch ms
+  // When the login that issued the token happened (epoch ms). Together with
+  // expiresAt it gives the token's lifetime, which bounds the early-refresh
+  // window. Bundles loaded from the DB take the row's updatedAt.
+  obtainedAt?: number;
   metadata?: Record<string, unknown>;
 }
 
@@ -87,7 +141,12 @@ export class LoginTokenService {
   private readonly encryptionKey: string;
 
   private cache = new Map<string, LoginTokenBundle>();
+  // Logins in progress (shared by getToken and forceRelogin).
   private inFlight = new Map<string, Promise<LoginTokenBundle>>();
+  // getToken resolutions in progress: DB read, then a login if needed.
+  private resolving = new Map<string, Promise<LoginTokenBundle>>();
+  // Connector → epoch ms before which a failed proactive re-login is not retried.
+  private retryAfter = new Map<string, number>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -103,31 +162,81 @@ export class LoginTokenService {
    * Return a valid token, fetching/refreshing as needed.
    * - Cache hit & not near expiry → return immediately
    * - Cache miss → check DB, then login if absent or expired
-   * - Near expiry → relogin proactively
+   * - Near expiry → relogin proactively; if that login fails while the old
+   *   token is still valid, keep using the old one
+   *
+   * Concurrent callers for the same connector share one resolution (DB read
+   * and login), so a burst of parallel tool calls logs in once.
    */
   async getToken(
     authConfig: LoginTokenAuthConfig,
     connectorId?: string,
+    request: LoginRequestOptions = {},
   ): Promise<LoginTokenBundle> {
     const key = this.cacheKey(authConfig, connectorId);
-    const proactiveSec =
-      authConfig.proactiveRefreshSeconds ?? DEFAULT_PROACTIVE_REFRESH_SECONDS;
-    const now = Date.now();
-
     const cached = this.cache.get(key);
-    if (cached && cached.expiresAt > now + proactiveSec * 1000) {
+    if (cached && this.isFresh(cached, authConfig)) return cached;
+    if (
+      cached &&
+      cached.expiresAt > Date.now() &&
+      (this.retryAfter.get(key) ?? 0) > Date.now()
+    ) {
       return cached;
     }
 
-    if (!cached && connectorId) {
+    const pending = this.resolving.get(key);
+    if (pending) return pending;
+
+    const p = this.resolveToken(authConfig, connectorId, cached, request).finally(() => {
+      this.resolving.delete(key);
+    });
+    this.resolving.set(key, p);
+    return p;
+  }
+
+  private async resolveToken(
+    authConfig: LoginTokenAuthConfig,
+    connectorId: string | undefined,
+    cached: LoginTokenBundle | undefined,
+    request: LoginRequestOptions,
+  ): Promise<LoginTokenBundle> {
+    const key = this.cacheKey(authConfig, connectorId);
+    let current = cached;
+    if (!current && connectorId) {
       const persisted = await this.loadFromDb(connectorId);
-      if (persisted && persisted.expiresAt > now + proactiveSec * 1000) {
+      if (persisted && this.isFresh(persisted, authConfig)) {
         this.cache.set(key, persisted);
         return persisted;
       }
+      current = persisted ?? undefined;
     }
 
-    return this.loginWithMutex(authConfig, connectorId);
+    try {
+      return await this.loginWithMutex(authConfig, connectorId, request);
+    } catch (err) {
+      // A proactive refresh that fails (the vendor's login is rate-limited or
+      // briefly down) must not fail a call the current token can still serve.
+      if (current && current.expiresAt > Date.now()) {
+        this.cache.set(key, current);
+        this.retryAfter.set(key, Date.now() + PROACTIVE_RETRY_BACKOFF_MS);
+        this.logger.warn(
+          `LOGIN_TOKEN: proactive re-login failed for connector ${connectorId ?? '(none)'}, using the current token until it expires: ${(err as Error).message}`,
+        );
+        return current;
+      }
+      throw err;
+    }
+  }
+
+  private isFresh(
+    bundle: LoginTokenBundle,
+    authConfig: LoginTokenAuthConfig,
+  ): boolean {
+    const windowMs = proactiveRefreshWindowMs(
+      bundle,
+      authConfig.proactiveRefreshSeconds,
+    );
+    return bundle.expiresAt > Date.now() + windowMs;
   }
 
   /**
@@ -136,21 +245,23 @@ export class LoginTokenService {
   async forceRelogin(
     authConfig: LoginTokenAuthConfig,
     connectorId?: string,
+    request: LoginRequestOptions = {},
   ): Promise<LoginTokenBundle> {
     const key = this.cacheKey(authConfig, connectorId);
     this.cache.delete(key);
-    return this.loginWithMutex(authConfig, connectorId);
+    return this.loginWithMutex(authConfig, connectorId, request);
   }
 
   private async loginWithMutex(
     authConfig: LoginTokenAuthConfig,
-    connectorId?: string,
+    connectorId: string | undefined,
+    request: LoginRequestOptions,
   ): Promise<LoginTokenBundle> {
     const key = this.cacheKey(authConfig, connectorId);
     const existing = this.inFlight.get(key);
     if (existing) return existing;
 
-    const p = this.performLogin(authConfig, connectorId).finally(() => {
+    const p = this.performLogin(authConfig, connectorId, request).finally(() => {
       this.inFlight.delete(key);
     });
     this.inFlight.set(key, p);
@@ -159,7 +270,8 @@ export class LoginTokenService {
 
   private async performLogin(
     authConfig: LoginTokenAuthConfig,
-    connectorId?: string,
+    connectorId: string | undefined,
+    request: LoginRequestOptions,
   ): Promise<LoginTokenBundle> {
     this.requireString(authConfig.loginUrl, 'loginUrl');
     this.requireString(authConfig.username, 'username');
@@ -168,7 +280,7 @@ export class LoginTokenService {
       this.requireString(authConfig.tokenJsonPath, 'tokenJsonPath');
     }
 
-    const passwordToSend = await this.preparePassword(authConfig);
+    const passwordToSend = await this.preparePassword(authConfig, request);
 
     const templateParams: Record<string, string> = {
       username: authConfig.username,
@@ -207,7 +319,9 @@ export class LoginTokenService {
       data = templateParams;
     }
 
-    this.logger.debug(`LOGIN_TOKEN: logging in via ${method} ${url}`);
+    this.logger.debug(
+      `LOGIN_TOKEN: logging in via ${method} ${url}${request.proxyUrl ? ' (via proxy)' : ''}`,
+    );
     const response = await axios({
       method,
       url,
@@ -219,6 +333,7 @@ export class LoginTokenService {
         credentialHeaders: Object.keys(authConfig.loginHeaders || {}),
         credentialsInBody: true,
       }),
+      ...proxyAgents(request),
     });
 
     let token: unknown;
@@ -264,6 +379,7 @@ export class LoginTokenService {
       }
     }
 
+    const obtainedAt = Date.now();
     const expiresAt = this.computeExpiresAt(authConfig, response.data);
     const aud = authConfig.audJsonPath
       ? (jsonPath(response.data, authConfig.audJsonPath) as
@@ -275,11 +391,13 @@ export class LoginTokenService {
       token: String(token),
       aud: aud || undefined,
       expiresAt,
+      obtainedAt,
       metadata: aud ? { aud } : undefined,
     };
 
     const key = this.cacheKey(authConfig, connectorId);
     this.cache.set(key, bundle);
+    this.retryAfter.delete(key);
     if (connectorId) {
       await this.persist(connectorId, bundle);
     }
@@ -288,6 +406,7 @@ export class LoginTokenService {
 
   private async preparePassword(
     authConfig: LoginTokenAuthConfig,
+    request: LoginRequestOptions,
   ): Promise<string> {
     const hashing = authConfig.passwordHashing;
     if (!hashing || hashing.scheme === 'none') return authConfig.password;
@@ -297,7 +416,7 @@ export class LoginTokenService {
       );
     }
 
-    const salt = await this.resolveSalt(authConfig);
+    const salt = await this.resolveSalt(authConfig, request);
     if (!salt) {
       throw new Error(
         'LOGIN_TOKEN: passwordHashing.scheme=bcrypt requires a non-empty salt',
@@ -308,6 +427,7 @@ export class LoginTokenService {
 
   private async resolveSalt(
     authConfig: LoginTokenAuthConfig,
+    request: LoginRequestOptions,
   ): Promise<string | null> {
     const src = authConfig.passwordHashing?.saltSource;
     if (!src) return null;
@@ -331,6 +451,7 @@ export class LoginTokenService {
       headers: src.headers,
       timeout: 10000,
       ...outboundAxiosOptions({ credentialHeaders: Object.keys(src.headers || {}) }),
+      ...proxyAgents(request),
     });
 
     const path = src.responsePath || 'salt';
@@ -396,6 +517,9 @@ export class LoginTokenService {
       return {
         token: decrypt(row.token, this.encryptionKey),
         expiresAt: row.expiresAt.getTime(),
+        // persist() writes the row right after the login, so updatedAt is
+        // when the token was issued.
+        obtainedAt: row.updatedAt?.getTime(),
         aud: (row.metadata as { aud?: string } | null)?.aud,
         metadata: (row.metadata as Record<string, unknown> | null) || undefined,
       };
@@ -643,4 +767,14 @@ export function extractLoginRefusal(body: unknown): string | null {
     return null;
   };
   return walk(body, 0);
+}
+
+/**
+ * Agents for a login that goes through the connector proxy, set after the
+ * outbound spread as the tool calls do (see rest.engine). Empty without one.
+ */
+function proxyAgents(request: LoginRequestOptions) {
+  if (!request.proxyUrl) return {};
+  const agent = createUnblockerProxyAgent(request.proxyUrl);
+  return { httpAgent: agent, httpsAgent: agent, proxy: false as const };
 }

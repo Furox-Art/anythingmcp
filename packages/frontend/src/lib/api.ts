@@ -1,4 +1,5 @@
 import type { ClickIds, SignupAttribution } from './attribution';
+import type { CheckoutSource } from './checkout-source';
 
 // Use relative paths so requests go to the same origin.
 // In production (Docker / Railway) Next.js rewrites proxy /api/* to the backend.
@@ -24,6 +25,25 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * A fetch that rejects with a plain object instead of resolving with the
+ * response, e.g. `{ status: 401, error: true, body: { message } }`: what a
+ * browser extension wrapping `window.fetch` does (ANYTHINGMCP-CLOUD-FRONTEND-H,
+ * Safari). Callers tell a refused session from a network failure with
+ * `instanceof ApiError`, so such an object becomes one, with a stack.
+ * Anything else (a TypeError from the network, an AbortError) is returned
+ * as it is.
+ */
+export function asApiError(reason: unknown): unknown {
+  if (reason instanceof Error || typeof reason !== 'object' || reason === null) return reason;
+  const { status, body, message } = reason as { status?: unknown; body?: unknown; message?: unknown };
+  if (typeof status !== 'number') return reason;
+  const said = (body as { message?: unknown } | null | undefined)?.message;
+  const text =
+    typeof said === 'string' && said ? said : typeof message === 'string' && message ? message : `API error: ${status}`;
+  return new ApiError(text, status, body ?? null);
+}
+
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, token } = options;
 
@@ -35,20 +55,30 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  const response = await fetch(`${API_BASE}${path}`, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  // Auto-logout on 401 for authenticated requests, except when explicitly opting out
+  // (self-delete intentionally returns 401 for wrong password — let the caller handle it)
+  const signOutOn401 = (status: number) => {
+    if (status === 401 && token && !options.skipAutoLogout) {
+      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+    }
+  };
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (err) {
+    const error = asApiError(err);
+    if (error instanceof ApiError) signOutOn401(error.status);
+    throw error;
+  }
 
   if (!response.ok) {
     const errorBody = await response.json().catch(() => ({ message: response.statusText }));
-    // Auto-logout on 401 for authenticated requests, except when explicitly opting out
-    // (self-delete intentionally returns 401 for wrong password — let the caller handle it)
-    const skipAutoLogout = options.skipAutoLogout;
-    if (response.status === 401 && token && !skipAutoLogout) {
-      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
-    }
+    signOutOn401(response.status);
     const message = errorBody.message || errorBody.error || `API error: ${response.status}`;
     throw new ApiError(message, response.status, errorBody);
   }
@@ -347,9 +377,62 @@ export function withSecretsNotice(message: string, res: unknown): string {
   return parts.filter(Boolean).join(' ');
 }
 
+/** Part of an import answer: tools that could not take the name the source gives them. */
+export interface ImportNameSummary {
+  /** Matched tools that kept their name because another tool already uses the new one. */
+  renameConflicts?: Array<{ toolId: string; kept: string; wanted: string }>;
+  /** Parsed tools not created because their name is already in use. */
+  skipped?: string[];
+}
+
+/**
+ * `withSecretsNotice`, plus a warning about tool names the import could not
+ * apply. The import itself succeeded; this only tells the admin why a tool
+ * kept its old name or was left out.
+ */
+export function withImportNotice(message: string, res: unknown): string {
+  const summary = (res ?? {}) as ImportNameSummary;
+  const parts = [withSecretsNotice(message, res)];
+  const conflicts = summary.renameConflicts ?? [];
+  if (conflicts.length) {
+    const list = conflicts.map((c) => `${c.kept} (wanted ${c.wanted})`).join(', ');
+    parts.push(
+      `Warning: ${conflicts.length === 1 ? 'one tool kept its name' : `${conflicts.length} tools kept their names`} because another tool already uses the new one: ${list}. Rename or delete the other tool and import again to apply it.`,
+    );
+  }
+  if (summary.skipped?.length) {
+    parts.push(
+      `Warning: not imported, the name is used twice: ${summary.skipped.join(', ')}.`,
+    );
+  }
+  return parts.join(' ');
+}
+
+export interface Connector {
+  id: string;
+  name: string;
+  type: string;
+  slug?: string;
+  baseUrl?: string;
+  isActive?: boolean;
+  authType?: string;
+  icon?: string | null;
+  setupStatus?: string;
+  missingVariables?: string[];
+  /** Credential health: 'needs_reauth' (calls fail until fixed) or 'expiring'. */
+  authStatus?: string | null;
+  authStatusCode?: string | null;
+  authStatusMessage?: string | null;
+  authStatusAt?: string | null;
+  tokenExpiresAt?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  [key: string]: unknown;
+}
+
 export const connectors = {
   list: (token: string) =>
-    request<any[]>('/api/connectors', { token }),
+    request<Connector[]>('/api/connectors', { token }),
   proxyAvailability: (token: string) =>
     request<{ available: boolean }>('/api/connectors/proxy-availability', { token }),
   /**
@@ -459,9 +542,9 @@ export const connectors = {
       suggestedFix?: { action: string; hostname?: string; url?: string };
     }>(`/api/connectors/${id}/test`, { method: 'POST', token }),
   importSpec: (id: string, token: string) =>
-    request<{ message: string; tools: any[] } & SecretMoveSummary>(`/api/connectors/${id}/import-spec`, { method: 'POST', token }),
+    request<{ message: string; tools: any[] } & SecretMoveSummary & ImportNameSummary>(`/api/connectors/${id}/import-spec`, { method: 'POST', token }),
   importTools: (id: string, data: { source: string; content?: string; url?: string }, token: string) =>
-    request<{ message: string; tools: any[]; skipped?: string[] } & SecretMoveSummary>(`/api/connectors/${id}/import`, { method: 'POST', body: data, token }),
+    request<{ message: string; tools: any[] } & SecretMoveSummary & ImportNameSummary>(`/api/connectors/${id}/import`, { method: 'POST', body: data, token }),
   // Secrets come back from the server empty and named in `maskedEnvVars`;
   // sending one back empty keeps its stored value.
   updateEnvVars: (id: string, envVars: Record<string, string>, token: string) =>
@@ -483,10 +566,22 @@ export const connectors = {
       '/api/mcp-oauth/complete',
       { method: 'POST', token, body: { state, code } },
     ),
+  /** "Authorize with Provider" for a Shopee shop: the signed shop authorization link. */
+  shopeeAuthorize: (id: string, token: string, returnTo?: string) =>
+    request<{ authorizationUrl?: string; error?: string }>(
+      `/api/shopee/connectors/${id}/authorize`,
+      { method: 'POST', token, body: returnTo ? { returnTo } : undefined },
+    ),
+  /** Second half of a Shopee shop authorization: exchange the code Shopee sent back. */
+  shopeeComplete: (state: string, code: string, shopId: string, token: string) =>
+    request<{ connectorId: string; toolsImported: number; returnTo?: string }>(
+      '/api/shopee/complete',
+      { method: 'POST', token, body: { state, code, shopId } },
+    ),
   oauthRedirectUri: (token: string) =>
     request<{ redirectUri: string }>('/api/connectors/oauth/redirect-uri', { token }),
   discoverTools: (id: string, token: string) =>
-    request<{ message: string; tools: any[]; skipped?: string[]; error?: string } & SecretMoveSummary>(
+    request<{ message: string; tools: any[]; error?: string } & SecretMoveSummary & ImportNameSummary>(
       `/api/connectors/${id}/discover-tools`,
       { method: 'POST', token },
     ),
@@ -541,6 +636,15 @@ export type VerifyResult =
 
 export type ConnectorSetupStatus = 'ready' | 'needs_input' | 'needs_authorization';
 
+/** A catalog connector serving the API at a URL the user typed. */
+export interface CatalogUrlMatch {
+  slug: string;
+  name: string;
+  icon: string;
+  description: string;
+  toolCount: number;
+}
+
 export const adapters = {
   list: (token: string) =>
     request<any[]>('/api/adapters', { token }),
@@ -567,6 +671,12 @@ export const adapters = {
       token,
       body: { credentials, ...(connectorId ? { connectorId } : {}) },
     }),
+  /** Catalog connectors for the API at a base URL, best first. */
+  matchUrl: (url: string, token: string) =>
+    request<{ matches: CatalogUrlMatch[] }>(
+      `/api/adapters/match-url?url=${encodeURIComponent(url)}`,
+      { token },
+    ),
   popularConnectors: (token: string) =>
     request<{ items: PopularConnectorItem[] }>('/api/adapters/popular-connectors', { token }),
   starterPack: (token: string) =>
@@ -882,6 +992,17 @@ export interface KgSettings {
   edgeAutoApply: boolean;
 }
 
+export type LearningMode = 'inherit' | 'on' | 'off';
+
+export interface MemberLearning {
+  /** The workspace switch ("Capture user intent"). */
+  workspaceDefault: boolean;
+  mode: LearningMode;
+  optOut: boolean;
+  /** Whether this member's requests are used for skill learning right now. */
+  effective: boolean;
+}
+
 export interface KgSkillList {
   items: KgSkill[];
   total: number;
@@ -898,6 +1019,24 @@ export const knowledgeGraph = {
     ),
   getSettings: (token: string) =>
     request<KgSettings>('/api/knowledge-graph/settings', { token }),
+  learning: {
+    me: (token: string) =>
+      request<MemberLearning>('/api/knowledge-graph/learning/me', { token }),
+    setMine: (token: string, body: { optOut: boolean; clearIntents?: boolean }) =>
+      request<MemberLearning & { intentsCleared: number }>('/api/knowledge-graph/learning/me', {
+        token,
+        method: 'PUT',
+        body,
+      }),
+    setMembers: (
+      token: string,
+      body: { userIds: string[]; mode: LearningMode; clearIntents?: boolean },
+    ) =>
+      request<{ updated: number; notFound: string[]; intentsCleared: number }>(
+        '/api/knowledge-graph/learning/members',
+        { token, method: 'PUT', body },
+      ),
+  },
   updateSettings: (
     token: string,
     body: {
@@ -965,9 +1104,10 @@ export const knowledgeGraph = {
   skills: {
     list: (
       token: string,
-      params?: { status?: string; q?: string; take?: number; skip?: number },
+      params?: { status?: string; q?: string; take?: number; skip?: number; folderId?: string },
     ) => {
       const qs = new URLSearchParams();
+      if (params?.folderId) qs.set('folderId', params.folderId);
       if (params?.status) qs.set('status', params.status);
       if (params?.q) qs.set('q', params.q);
       if (params?.take != null) qs.set('take', String(params.take));
@@ -975,8 +1115,13 @@ export const knowledgeGraph = {
       const suffix = qs.toString() ? `?${qs.toString()}` : '';
       return request<KgSkillList>(`/api/knowledge-graph/skills${suffix}`, { token });
     },
+    proposeFromErrors: (token: string) =>
+      request<{ created: number; patterns: number }>('/api/knowledge-graph/skills/propose-from-errors', {
+        token,
+        method: 'POST',
+      }),
     consolidate: (token: string, mcpServerId?: string) =>
-      request<{ before: number; after: number; model?: string }>(
+      request<{ before: number; after: number; proposed?: number; replaced?: number; model?: string }>(
         '/api/knowledge-graph/skills/consolidate',
         { token, method: 'POST', body: mcpServerId ? { mcpServerId } : {} },
       ),
@@ -989,6 +1134,8 @@ export const knowledgeGraph = {
         connectorId?: string | null;
         mcpServerId?: string | null;
         status?: string;
+        body?: string | null;
+        folderId?: string | null;
       },
     ) => request<KgSkill>('/api/knowledge-graph/skills', { token, method: 'POST', body }),
     generate: (token: string, mcpServerId?: string) =>
@@ -1004,8 +1151,17 @@ export const knowledgeGraph = {
     update: (
       token: string,
       id: string,
-      patch: { title?: string; whenToUse?: string; instruction?: string; status?: string },
+      patch: {
+        title?: string;
+        whenToUse?: string;
+        instruction?: string;
+        body?: string | null;
+        status?: string;
+        folderId?: string | null;
+      },
     ) => request<KgSkill>(`/api/knowledge-graph/skills/${id}`, { token, method: 'PATCH', body: patch }),
+    versions: (token: string, id: string) =>
+      request<KgSkillVersion[]>(`/api/knowledge-graph/skills/${id}/versions`, { token }),
     remove: (token: string, id: string) =>
       request<{ ok: boolean }>(`/api/knowledge-graph/skills/${id}`, { token, method: 'DELETE' }),
   },
@@ -1023,6 +1179,153 @@ export interface KgSkill {
   confidence: number;
   evidenceCount: number;
   status: string;
+  /** manual | llm | finder */
+  source?: string;
+  /** Optional full procedure (markdown), served on demand by skill_get. */
+  body?: string | null;
+  version?: number;
+  useCount?: number;
+  lastUsedAt?: string | null;
+  folderId?: string | null;
+  /** For a merge proposal: the active skills applying it deactivates. */
+  replaces?: string[];
+}
+
+export interface KnowledgeFolder {
+  id: string;
+  parentId: string | null;
+  name: string;
+  description: string | null;
+  /** Custom roles the folder (and its subtree) is limited to; empty = everyone. */
+  roleIds: string[];
+  /** "Sales / Quotes" */
+  path: string;
+  depth: number;
+  skillCount: number;
+  memoryCount: number;
+}
+
+export const knowledgeFolders = {
+  list: (token: string) =>
+    request<{ folders: KnowledgeFolder[]; restrictionsAvailable: boolean }>('/api/knowledge-folders', { token }),
+  create: (token: string, body: { name: string; parentId?: string | null; description?: string | null }) =>
+    request<KnowledgeFolder>('/api/knowledge-folders', { token, method: 'POST', body }),
+  update: (
+    token: string,
+    id: string,
+    body: { name?: string; parentId?: string | null; description?: string | null },
+  ) => request<KnowledgeFolder>(`/api/knowledge-folders/${id}`, { token, method: 'PATCH', body }),
+  remove: (token: string, id: string) =>
+    request<{ ok: boolean; movedTo: string | null }>(`/api/knowledge-folders/${id}`, { token, method: 'DELETE' }),
+  setRoles: (token: string, id: string, roleIds: string[]) =>
+    request<KnowledgeFolder>(`/api/knowledge-folders/${id}/roles`, { token, method: 'PUT', body: { roleIds } }),
+  move: (token: string, kind: 'skill' | 'memory', ids: string[], folderId: string | null) =>
+    request<{ moved: number }>('/api/knowledge-folders/move', {
+      token,
+      method: 'POST',
+      body: { kind, ids, folderId },
+    }),
+};
+
+export type MemoryAccessLevel = 'none' | 'read' | 'personal' | 'contribute';
+export type MemoryAccessSetting = 'inherit' | MemoryAccessLevel;
+export type MemoryScope = 'personal' | 'organization';
+
+export interface MemoryItem {
+  id: string;
+  scope: MemoryScope;
+  kind: 'fact' | 'preference' | 'note';
+  content: string;
+  tags: string[];
+  status: 'active' | 'pending' | 'rejected';
+  source: { via?: 'mcp' | 'ui'; mcpServerId?: string; client?: string };
+  ownerUserId: string | null;
+  folderId?: string | null;
+  /** Knowledge-graph entity the item is about, e.g. "customer". */
+  about?: string | null;
+  createdByUserId: string | null;
+  approvedByUserId: string | null;
+  approvedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MemoryStatus {
+  licensed: boolean;
+  access: MemoryAccessLevel;
+  settings: { defaultAccess: MemoryAccessLevel; writeMode: 'approval' | 'auto' };
+  isCurator: boolean;
+}
+
+export const memory = {
+  status: (token: string) => request<MemoryStatus>('/api/memory/status', { token }),
+  list: (
+    token: string,
+    params: {
+      scope: MemoryScope;
+      status?: string;
+      q?: string;
+      take?: number;
+      skip?: number;
+      folderId?: string;
+    },
+  ) => {
+    const qs = new URLSearchParams({ scope: params.scope });
+    if (params.folderId) qs.set('folderId', params.folderId);
+    if (params.status) qs.set('status', params.status);
+    if (params.q) qs.set('q', params.q);
+    if (params.take != null) qs.set('take', String(params.take));
+    if (params.skip != null) qs.set('skip', String(params.skip));
+    return request<{ items: MemoryItem[]; total: number; pending: number; take: number; skip: number }>(
+      `/api/memory/items?${qs.toString()}`,
+      { token },
+    );
+  },
+  create: (
+    token: string,
+    body: {
+      content: string;
+      kind?: string;
+      scope?: MemoryScope;
+      tags?: string[];
+      folderId?: string | null;
+      about?: string | null;
+    },
+  ) => request<MemoryItem>('/api/memory/items', { token, method: 'POST', body }),
+  update: (
+    token: string,
+    id: string,
+    body: { content?: string; kind?: string; tags?: string[]; about?: string | null },
+  ) =>
+    request<MemoryItem>(`/api/memory/items/${id}`, { token, method: 'PATCH', body }),
+  remove: (token: string, id: string) =>
+    request<{ ok: boolean }>(`/api/memory/items/${id}`, { token, method: 'DELETE' }),
+  approve: (token: string, id: string) =>
+    request<MemoryItem>(`/api/memory/items/${id}/approve`, { token, method: 'POST' }),
+  reject: (token: string, id: string) =>
+    request<MemoryItem>(`/api/memory/items/${id}/reject`, { token, method: 'POST' }),
+  updateSettings: (
+    token: string,
+    body: { defaultAccess?: MemoryAccessLevel; writeMode?: 'approval' | 'auto' },
+  ) => request<MemoryStatus['settings']>('/api/memory/settings', { token, method: 'PUT', body }),
+  setAccess: (token: string, userIds: string[], access: MemoryAccessSetting) =>
+    request<{ updated: number; notFound: string[] }>('/api/memory/members/access', {
+      token,
+      method: 'PUT',
+      body: { userIds, access },
+    }),
+  erasePersonal: (token: string, userId: string) =>
+    request<{ erased: number }>(`/api/memory/members/${userId}/personal`, { token, method: 'DELETE' }),
+};
+
+export interface KgSkillVersion {
+  version: number;
+  title: string;
+  whenToUse: string;
+  instruction: string;
+  body: string | null;
+  editedByUserId: string | null;
+  createdAt: string;
 }
 
 // Server settings (public)
@@ -1391,6 +1694,15 @@ export function editionErrorCode(err: unknown): string | null {
   return code === EDITION_REQUIRED || code === SEAT_LIMIT ? code : null;
 }
 
+// Support chat (only on instances we operate; 404 elsewhere)
+export const support = {
+  widget: (token: string) =>
+    request<{ baseUrl: string; inboxId: string; userJwt: string }>('/api/support/widget', {
+      token,
+      skipAutoLogout: true,
+    }),
+};
+
 // License
 export const license = {
   getEdition: (token: string) =>
@@ -1408,6 +1720,11 @@ export const license = {
       trialDaysLeft?: number;
       /** Cloud, paid licences: the Stripe subscription's state. */
       billing?: LicenseBilling;
+      /**
+       * Cloud: the paid licence stopped because a card was declined, and
+       * Stripe is still retrying the subscription. Fixed with a new card.
+       */
+      paymentFailed?: boolean;
     }>('/api/license/status', { token }),
   /** Re-verify now (cloud, admin); at most once a minute per workspace. */
   refresh: (token: string) =>
@@ -1433,7 +1750,8 @@ export const license = {
       method: 'POST',
       token,
     }),
-  billingPortal: (token: string, returnUrl?: string, flow?: 'cancel') =>
+  /** 'cancel' opens Stripe's cancellation page, 'payment_method_update' the page to add a card. */
+  billingPortal: (token: string, returnUrl?: string, flow?: 'cancel' | 'payment_method_update') =>
     request<{ url: string }>('/api/license/billing-portal', {
       method: 'POST',
       body: { returnUrl, ...(flow && { flow }) },
@@ -1451,8 +1769,8 @@ export const license = {
       billingPeriod: 'monthly' | 'yearly';
       trial: boolean;
       promo?: string;
-      /** The in-app offer that led here; reaches Stripe as metadata.trial_source. */
-      source?: 'first_success';
+      /** Where in the app the checkout started; reaches Stripe as metadata.checkout_source. */
+      source?: CheckoutSource;
     },
   ) =>
     /** `trial`: whether the licence site granted the card trial asked for. */
@@ -1461,6 +1779,12 @@ export const license = {
       body,
       token,
     }),
+  /**
+   * Cloud: the signed-in user's address token for pricing links (`#t=`), so
+   * the pricing page knows who is buying. Null when the server has none.
+   */
+  pricingLinkToken: (token: string) =>
+    request<{ token: string | null }>('/api/license/pricing-link-token', { token, skipAutoLogout: true }),
   /**
    * Cloud (ADMIN): can this address start a card trial? 'pay' = it had a
    * subscription before, so a plan starts and is billed today.
@@ -1492,10 +1816,25 @@ export const license = {
     }>('/api/license/usage', { token }),
 };
 
+export interface McpServer {
+  id: string;
+  name: string;
+  slug?: string;
+  description?: string;
+  instructions?: string;
+  isActive?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+  usage?: { calls30d: number; lastCallAt: string | null };
+  _count?: { connectors: number; apiKeys: number };
+  connectors?: Array<{ connector: { name: string } }>;
+  [key: string]: unknown;
+}
+
 // MCP Servers
 export const mcpServers = {
   list: (token: string) =>
-    request<any[]>('/api/mcp-servers', { token }),
+    request<McpServer[]>('/api/mcp-servers', { token }),
   get: (id: string, token: string) =>
     request<any>(`/api/mcp-servers/${id}`, { token }),
   /** Calls in the last 30 days and the last one's time (the connect page's live check). */
@@ -1503,7 +1842,7 @@ export const mcpServers = {
     request<{ calls30d: number; lastCallAt: string | null }>(`/api/mcp-servers/${id}/activity`, { token }),
   create: (data: { name: string; slug?: string; description?: string; instructions?: string }, token: string) =>
     request<any>('/api/mcp-servers', { method: 'POST', body: data, token }),
-  update: (id: string, data: { name?: string; slug?: string; description?: string; instructions?: string; isActive?: boolean }, token: string) =>
+  update: (id: string, data: { name?: string; slug?: string; description?: string; instructions?: string; isActive?: boolean; skillsDelivery?: 'auto' | 'inline' | 'index' }, token: string) =>
     request<any>(`/api/mcp-servers/${id}`, { method: 'PUT', body: data, token }),
   delete: (id: string, token: string) =>
     request(`/api/mcp-servers/${id}`, { method: 'DELETE', token }),
