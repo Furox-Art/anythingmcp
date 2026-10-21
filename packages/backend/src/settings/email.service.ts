@@ -4,6 +4,7 @@ import axios from 'axios';
 import { SiteSettingsService } from './site-settings.service';
 import { OrgSettingsService } from './org-settings.service';
 import { PrismaService } from '../common/prisma.service';
+import { findUserByEmail } from '../common/email.util';
 import { DeploymentService } from '../common/deployment.service';
 import { TrustStatsService } from '../public-stats/trust-stats.service';
 import { EMPTY_TRUST_STATS, TrustStats, formatTrustStats } from '../public-stats/trust-stats.format';
@@ -15,6 +16,7 @@ import {
   WinbackOffer,
   activationReminderEmail,
   cardTrialOfferEmail,
+  connectorAuthEmail,
   existingAccountEmail,
   invitationEmail,
   licenseKeyEmail,
@@ -104,9 +106,7 @@ export class EmailService {
     const cloudUrl = this.cloudUrl();
     const secret = unsubscribeSecret();
     const user = secret
-      ? await this.prisma.user
-          .findUnique({ where: { email: to }, select: { id: true } })
-          .catch(() => null)
+      ? await findUserByEmail<{ id: string; email: string }>(this.prisma, to, { id: true }).catch(() => null)
       : null;
     if (secret && user) {
       const url = buildUnsubscribeUrl(cloudUrl, user.id, secret);
@@ -692,6 +692,42 @@ export class EmailService {
       return true;
     } catch (err) {
       this.logger.error(`Failed to send card-trial offer email to ${to}: ${err}`);
+      return false;
+    }
+  }
+
+  /**
+   * A connector whose credential the provider refused for good (see
+   * ConnectorAuthStatusService). Transactional, sent once per incident,
+   * through the workspace's SMTP or the system one. False when none is
+   * configured (self-hosted without SMTP): the dashboard still shows it.
+   */
+  async sendConnectorAuthEmail(
+    to: string,
+    input: { name: string | null; connectorName: string; message: string; connectorPath: string },
+    organizationId?: string,
+  ): Promise<boolean> {
+    const transport = await this.createTransporter(organizationId);
+    if (!transport) {
+      this.logger.warn(`Skipping connector sign-in email to ${to}: no SMTP configured`);
+      return false;
+    }
+    const base = (process.env.FRONTEND_URL || '').trim().replace(/\/+$/, '') || this.cloudUrl();
+    const email = connectorAuthEmail(
+      {
+        name: input.name,
+        connectorName: input.connectorName,
+        message: input.message,
+        connectorUrl: `${base}${input.connectorPath}`,
+      },
+      await this.brand(),
+    );
+    try {
+      await transport.transporter.sendMail({ from: transport.from, to, ...this.mail(email) });
+      this.logger.log(`Connector sign-in email sent to ${to}`);
+      return true;
+    } catch (err) {
+      this.logger.error(`Failed to send connector sign-in email to ${to}: ${err}`);
       return false;
     }
   }

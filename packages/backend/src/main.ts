@@ -30,6 +30,7 @@ import { AppModule } from './app.module';
 import { mcpStrategy } from './mcp-server/mcp-strategy';
 import { McpAuthExceptionFilter } from './auth/mcp-auth-exception.filter';
 import { validateRequiredSecretsAtStartup } from './common/secrets.util';
+import { startMetricsServer, stopMetricsServer } from './common/metrics';
 
 async function bootstrap() {
   // Fail fast if required secrets are missing or use known placeholder values.
@@ -51,7 +52,17 @@ async function bootstrap() {
   // body-parser's default `type` matches only application/json, so without
   // this every SCIM POST/PATCH would arrive as an empty body and fail in ways
   // that look nothing like a content-type problem.
-  app.use(json({ limit: '10mb', type: ['application/json', 'application/scim+json'] }));
+  // `verify` keeps the raw bytes of signed webhooks, whose HMAC must be
+  // computed over the body exactly as sent.
+  app.use(
+    json({
+      limit: '10mb',
+      type: ['application/json', 'application/scim+json'],
+      verify: (req: any, _res, buf) => {
+        if (req.url?.startsWith('/api/support/webhook')) req.rawBody = buf;
+      },
+    }),
+  );
   app.use(urlencoded({ extended: true, limit: '10mb' }));
 
   const configService = app.get(ConfigService);
@@ -162,6 +173,10 @@ async function bootstrap() {
   server.keepAliveTimeout = 65_000;
   server.headersTimeout = 66_000;
 
+  // Second, separate listener — never the main app or port 4000, since
+  // /health* is proxied publicly on both Cloud and self-hosted.
+  startMetricsServer();
+
   // A SIGTERM must end in an exit, every time, within a bounded time.
   //
   // It did not. `app.close()` calls `server.close()`, which resolves only
@@ -197,6 +212,7 @@ async function bootstrap() {
       }, cutConnectionsAfterMs);
       cutter.unref();
       try {
+        await stopMetricsServer();
         await app.close();
         logger.log('Shutdown complete.');
         process.exit(0);

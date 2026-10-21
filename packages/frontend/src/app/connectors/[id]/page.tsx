@@ -15,6 +15,7 @@ import { Button, buttonVariants } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Badge, StatusPill } from '@/components/ui/badge';
 import { SetupStatusBanner, SetupStatusPill } from '@/components/setup-status';
+import { AuthStatusBanner, AuthStatusPill } from '@/components/auth-status';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { authTypeLabel, cn } from '@/lib/utils';
@@ -289,6 +290,13 @@ export default function ConnectorDetailPage() {
   >([]);
   const [savingEnvVars, setSavingEnvVars] = useState(false);
 
+  const resetOauth1Fields = () => {
+    setEditOauth1Key('');
+    setEditOauth1Secret('');
+    setEditOauth1Token('');
+    setEditOauth1TokenSecret('');
+  };
+
   const fetchConnector = async () => {
     if (!token) return;
     try {
@@ -402,13 +410,6 @@ export default function ConnectorDetailPage() {
 
     fetchConnector();
   }, [token, id]);
-
-  const resetOauth1Fields = () => {
-    setEditOauth1Key('');
-    setEditOauth1Secret('');
-    setEditOauth1Token('');
-    setEditOauth1TokenSecret('');
-  };
 
   const buildAuthConfig = () => {
     // Only send authConfig if the user filled in credential fields;
@@ -893,6 +894,24 @@ export default function ConnectorDetailPage() {
     }
   };
 
+  // Shopee shops are authorized through Shopee's own signed link, not OAuth2.
+  const handleShopeeAuthorize = async () => {
+    if (!token) return;
+    setAuthorizing(true);
+    try {
+      const result = await connectors.shopeeAuthorize(id, token);
+      if (result.authorizationUrl) {
+        window.location.href = result.authorizationUrl;
+      } else if (result.error) {
+        setMsg(result.error);
+      }
+    } catch (err: any) {
+      setMsg(`Authorization failed: ${err.message}`);
+    } finally {
+      setAuthorizing(false);
+    }
+  };
+
   const handleDiscoverTools = async () => {
     if (!token) return;
     setDiscovering(true);
@@ -1022,6 +1041,7 @@ export default function ConnectorDetailPage() {
                 {connector.isActive ? 'Active' : 'Inactive'}
               </StatusPill>
               <SetupStatusPill status={connector.setupStatus} />
+              <AuthStatusPill connector={connector} />
             </div>
             <div className="mt-0.5 break-all font-mono text-[12.5px] text-[var(--text-3)]">
               {connector.baseUrl}
@@ -1030,6 +1050,7 @@ export default function ConnectorDetailPage() {
         </div>
 
         <SetupStatusBanner connector={connector} />
+        <AuthStatusBanner connector={connector} />
 
         {msg && (
           <div className="rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] p-3 text-sm text-[var(--text-2)]">
@@ -1699,6 +1720,20 @@ export default function ConnectorDetailPage() {
                 </Button>
               )}
             </div>
+          </Card>
+        )}
+
+        {/* Shopee shop authorization (HMAC-signed, Shopee's own flow) */}
+        {connector.authType === 'HMAC' && (connector.config as any)?.adapterSlug === 'shopee' && (
+          <Card className="p-[22px]">
+            <h3 className="text-sm font-semibold mb-2">Shopee shop authorization</h3>
+            <p className="text-sm text-[var(--text-3)] mb-4">
+              Sign in with the shop account and approve this app. The tokens are stored encrypted and renewed
+              automatically. Authorize again when the authorization expires or the connector asks for it.
+            </p>
+            <Button variant="primary" size="lg" onClick={handleShopeeAuthorize} disabled={authorizing}>
+              {authorizing ? 'Redirecting...' : 'Authorize with Provider'}
+            </Button>
           </Card>
         )}
 
